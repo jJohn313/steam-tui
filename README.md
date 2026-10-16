@@ -8,19 +8,20 @@ Intercepts interactive terminal calls to `steam` to deliver an instantaneous, ke
 
 ## ⚡ Highlights
 
-- **Zero-Bloat Terminal Launcher**: Typing `steam` in any terminal immediately opens an ultra-fast `fzf` browser instead of spinning up the 1GB+ CEF/Chromium Steam interface.
-- **Multi-Drive Library Discovery**: Automatically traverses and indexes `libraryfolders.vdf` across all mounted drives (NVMe, SATA, Ext4, Btrfs, NTFS partitions).
-- **Fast Offline Binary VDF Parser**: Reads local Steam binary caches (`appinfo.vdf` v29) and user configs to detect both installed and uninstalled owned games in milliseconds without needing network requests or API keys.
-- **Kitty Terminal Art Previews**: Renders high-resolution game box art directly in Kitty (and compatible terminals) via `chafa`, along with metadata (app ID, size, status, playtime).
+- **Zero CEF / ~80MB Daemon Footprint**: Starts Steam with `-no-browser`, `-nofriendsui`, and `-vgui` to eliminate the ~1GB Chromium Embedded Framework (`steamwebhelper`) overhead while retaining full Steamworks DRM, cloud saves, and socket support.
+- **Automatic GUI RAM Reclamation**: Running `steam --gui` launches the full Store/Community client, monitors the Hyprland window lifecycle, and automatically shuts down CEF processes when the window is closed to immediately recover 1GB+ of system memory.
+- **Headless Terminal Installation & EULA Bypass**: Installs games directly from terminal via Steam internal console commands (`+app_install <appid> <lib_idx>`), bypassing GUI prompts, multi-step install modals, and EULA blocks.
+- **Interactive Multi-Drive Target Selector**: Prompts for target library destination when installing across multiple mounted drives with free disk space statistics.
+- **Real-Time Speed & Progress Tracking**: Reads live download throughput directly from Steam's `content_log.txt` (with ACF fallback), computing ETA and staging states.
+- **Pixel-Perfect Kitty Terminal Art**: Renders true-color box art directly in Kitty via `chafa -f kitty` or `kitten icat`, with instant canvas clearing to eliminate ghosting during rapid scrolling.
 - **Live Session Dashboard & HUD**: Tracks running game sessions with real-time CPU, RAM, VRAM, and runtime metrics, providing interactive controls:
   - `k`: Terminate game process cleanly
   - `b`: Return to library browser while game continues in background
   - `q`: Detach monitor and exit terminal
-- **Update Progress Tracker**: Automatically detects games in `[UPDATE]` or `[UPDATING]` state, displaying in-terminal download and staging progress before seamless launch.
+- **Terminal Uninstallation**: Press `Ctrl-X` inside `fzf` to cleanly dispatch `+app_uninstall` without touching the GUI.
 - **Self-Healing Lock Recovery**: Automatically diagnoses and clears orphaned FIFO pipes (`steam.pipe`) and stale PID locks (`steam.pid`) that otherwise cause Steam to hang indefinitely after GUI exits.
-- **Runtime Noise Filtering**: Automatically filters out Proton runtimes (Experimental, GE, Hotfix), Steam Linux Runtimes (Scout, Soldier, Sniper), Steamworks Common Redistributables, SteamVR, Soundtracks, and dedicated servers.
 - **Transparent Passthrough**:
-  - `steam <args>` passes through directly to `/usr/bin/steam "$@"` (e.g. `steam -shutdown`).
+  - `steam <args>` passes through directly to `/usr/bin/steam "$@"`.
   - `steam --gui` summons the native Steam graphical interface.
   - Launches from desktop menus / Rofi bypass the TUI automatically.
 
@@ -81,9 +82,12 @@ steam -silent -applaunch 730
 
 | Keybinding | Action |
 | :--- | :--- |
-| `<ENTER>` | **Installed Game**: Launches game and opens live session tracker.<br>**Available Game**: Prompts to install via native Steam download dialog. |
+| `<ENTER>` | **Installed Game**: Launches game and opens live session tracker.<br>**Available Game**: Triggers terminal install with drive selector and EULA bypass. |
+| `<Ctrl+I>` | Filters view to display **Installed / Updating games only**. |
+| `<Ctrl+A>` | Resets filter to show **All games** (installed + uninstalled). |
+| `<Ctrl+X>` | Prompts to **Uninstall selected game** directly from terminal. |
 | `<Ctrl+R>` | Rescans library drives, parses manifests, refreshes cache, and live-reloads list. |
-| `<ESC>` / `<Ctrl+C>` | Exits without launching Steam. |
+| `<ESC>` / `<Ctrl+C>` | Exits launcher without starting Steam. |
 | `Type to Filter` | Real-time fuzzy search across installed and owned games. |
 
 ### Controls in Live Session HUD
