@@ -36,15 +36,6 @@ def get_steam_env(headless=True):
         env["MILLENNIUM_RUNTIME_PATH"] = mill_path
     else:
         env.pop("MILLENNIUM_RUNTIME_PATH", None)
-        # Preload native 32-bit libXtst.so.6 before Millennium proxy in ubuntu12_32
-        for cand in [
-            "/usr/lib32/libXtst.so.6",
-            os.path.expanduser("~/.local/share/Steam/ubuntu12_32/steam-runtime/usr/lib/i386-linux-gnu/libXtst.so.6"),
-        ]:
-            if os.path.isfile(cand):
-                curr = env.get("LD_PRELOAD", "")
-                env["LD_PRELOAD"] = f"{cand}:{curr}" if curr else cand
-                break
     return env
 
 def get_steam_pss_mb():
@@ -1024,7 +1015,7 @@ def start_headless_daemon():
             print(" \033[1;32m[Ready]\033[0m")
         else:
             print(" \033[1;33m[Timeout waiting for LoggedOn, proceeding]\033[0m")
-        constrain_headless_cef()
+        constrain_headless_cef(in_game=False)
 
 def select_library_folder():
     """Let user pick target drive if multiple Steam libraries exist."""
@@ -1683,13 +1674,18 @@ def show_dashboard(target_appid=None):
         if old_settings:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
-def constrain_headless_cef():
+def constrain_headless_cef(in_game=False):
     """Surgical CEF and Steam daemon memory reducer for headless mode:
     1. Dedicated cgroup sub-slice for steamwebhelper PIDs only (MemoryHigh=128M, no MemoryMax).
     2. Moves all steamwebhelper PIDs (master root, zygotes, utilities) into steam-cef.slice.
-    3. Navigates non-SharedJSContext targets to about:blank via CDP WebSocket and /json/close/{tid}.
-    4. Triggers kernel memory.reclaim on steam-cef.slice twice with 0.5s delay.
-    5. Moves 32-bit steam daemon into steam-daemon.slice and pages out cold startup heap (300M reclaim).
+    3. Selectively unloads CEF targets:
+       - SharedJSContext is ALWAYS preserved (DRM, Cloud, Input).
+       - If not in_game: SP Desktop is preserved so launch interstitials can display/complete;
+         auxiliary tabs (Store, Community, Friends, Chat, etc.) are blanked.
+       - If in_game: SP Desktop is also blanked now that launch is complete.
+    4. Triggers kernel memory.reclaim on steam-cef.slice (500M) when in_game.
+    5. If in_game: moves ONLY the 32-bit steam daemon PID into steam-daemon.slice and pages out
+       cold startup tables (300M reclaim). Explicitly excludes any game, reaper, or proton PIDs.
     """
     import urllib.request
     import json
@@ -1734,7 +1730,7 @@ def constrain_headless_cef():
         except Exception:
             pass
 
-    # 3. Navigate non-SharedJSContext targets to about:blank via CDP WebSocket (releases React DOM)
+    # 3. Selectively navigate non-essential targets to about:blank via CDP WebSocket
     try:
         req = urllib.request.Request("http://127.0.0.1:8080/json", headers={"User-Agent": "steam-tui"})
         with urllib.request.urlopen(req, timeout=1.0) as resp:
@@ -1747,6 +1743,16 @@ def constrain_headless_cef():
                 # Do NOT touch SharedJSContext (required for Steamworks DRM, Steam Input, Cloud Sync)
                 if "SharedJSContext" in title or "SharedJSContext" in url:
                     continue
+
+                # Preserve SP Desktop during pre-launch so game launch interstitials function
+                is_sp_desktop = (
+                    "sp desktop" in title.lower()
+                    or "steam" in title.lower()
+                    or "steamloopback.host" in url.lower()
+                )
+                if not in_game and is_sp_desktop:
+                    continue
+
                 if ws:
                     cdp_send(ws, {"id": 1, "method": "Page.navigate", "params": {"url": "about:blank"}})
                 if tid:
@@ -1774,9 +1780,9 @@ def constrain_headless_cef():
         except Exception:
             pass
 
-    # Write 524288000 to memory.reclaim twice with 0.5s delay
+    # Write 524288000 to memory.reclaim on steam-cef.slice when in-game
     mem_reclaim_file = os.path.join(cgroup_dir, "memory.reclaim")
-    if os.path.isfile(mem_reclaim_file):
+    if os.path.isfile(mem_reclaim_file) and in_game:
         for _ in range(2):
             try:
                 with open(mem_reclaim_file, "w") as f:
@@ -1785,39 +1791,46 @@ def constrain_headless_cef():
                 pass
             time.sleep(0.5)
 
-    # 5. Reclaim cold startup heap (appinfo.vdf / package cache) from the 32-bit steam daemon process
-    try:
-        daemon_cgroup_dir = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/steam-daemon.slice"
-        os.makedirs(daemon_cgroup_dir, exist_ok=True)
-        d_mem_high = os.path.join(daemon_cgroup_dir, "memory.high")
-        if os.path.isfile(d_mem_high):
-            try:
-                with open(d_mem_high, "w") as f:
-                    f.write("max\n")
-            except Exception:
-                pass
-
-        d_procs_file = os.path.join(daemon_cgroup_dir, "cgroup.procs")
-        res_steam = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        steam_pids = res_steam.stdout.decode("utf-8").strip().split()
-        if os.path.isfile(d_procs_file) and steam_pids:
-            for spid in steam_pids:
+    # 5. When in-game: Reclaim cold startup heap (appinfo.vdf / package cache) from the 32-bit steam daemon process
+    # NEVER move steam into a slice at boot so child games are not trapped in a restricted cgroup!
+    if in_game:
+        try:
+            daemon_cgroup_dir = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/steam-daemon.slice"
+            os.makedirs(daemon_cgroup_dir, exist_ok=True)
+            d_mem_high = os.path.join(daemon_cgroup_dir, "memory.high")
+            if os.path.isfile(d_mem_high):
                 try:
-                    with open(d_procs_file, "w") as f:
-                        f.write(f"{spid}\n")
+                    with open(d_mem_high, "w") as f:
+                        f.write("max\n")
                 except Exception:
                     pass
 
-        # Write 300M (314572800) to memory.reclaim to page out cold startup tables
-        d_reclaim_file = os.path.join(daemon_cgroup_dir, "memory.reclaim")
-        if os.path.isfile(d_reclaim_file):
-            try:
-                with open(d_reclaim_file, "w") as f:
-                    f.write("314572800\n")
-            except OSError:
-                pass
-    except Exception:
-        pass
+            d_procs_file = os.path.join(daemon_cgroup_dir, "cgroup.procs")
+            res_steam = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            steam_pids = res_steam.stdout.decode("utf-8").strip().split()
+            if os.path.isfile(d_procs_file) and steam_pids:
+                for spid in steam_pids:
+                    # Explicit guard: ensure it's solely the steam client binary, not a game, runner, or wrapper
+                    try:
+                        with open(f"/proc/{spid}/cmdline", "rb") as f_cmd:
+                            cmd_raw = f_cmd.read()
+                            if b"reaper" in cmd_raw or b"gamescope" in cmd_raw or b"proton" in cmd_raw or b"AppId=" in cmd_raw:
+                                continue
+                        with open(d_procs_file, "w") as f:
+                            f.write(f"{spid}\n")
+                    except Exception:
+                        pass
+
+            # Write 300M (314572800) to memory.reclaim to page out cold startup tables
+            d_reclaim_file = os.path.join(daemon_cgroup_dir, "memory.reclaim")
+            if os.path.isfile(d_reclaim_file):
+                try:
+                    with open(d_reclaim_file, "w") as f:
+                        f.write("314572800\n")
+                except OSError:
+                    pass
+        except Exception:
+            pass
 
 def launch_and_monitor(appid, shortcut_id=None):
     """Launch game silently, track update/shaders if needed, and monitor session persistently."""
@@ -1884,8 +1897,8 @@ def launch_and_monitor(appid, shortcut_id=None):
             if time.time() - start_wait > 35:
                 break
 
-    # 5. Surgical in-game memory reduction for steamwebhelper (headless only)
-    constrain_headless_cef()
+    # 5. Surgical in-game memory reduction for steamwebhelper & steam daemon
+    constrain_headless_cef(in_game=True)
 
     # 6. Enter persistent dashboard monitor
     show_dashboard(appid)

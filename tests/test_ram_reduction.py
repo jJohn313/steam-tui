@@ -106,16 +106,16 @@ def run_test():
     boot_time = time.time() - start_time
     print(f"      Steam ready in {boot_time:.1f}s.")
 
-    # 3. Apply surgical memory reduction
-    print("\n[3/5] Applying surgical cgroup reclaim & CDP about:blank navigation...")
-    backend.constrain_headless_cef()
+    # 3. Apply surgical memory reduction (in_game=True)
+    print("\n[3/5] Applying surgical cgroup reclaim & in-game CDP navigation...")
+    backend.constrain_headless_cef(in_game=True)
     time.sleep(1.5)
 
     # 4. Measure accurate physical RAM
     print("\n[4/5] Measuring kernel-accounted physical memory (PSS)...")
     stats = get_detailed_ram()
 
-    print(f"\n  \033[1;32m● Total Unique Physical RAM (PSS): {stats['total_pss_mb']} MB\033[0m")
+    print(f"\n  \033[1;32m● Total In-Game Physical RAM (PSS): {stats['total_pss_mb']} MB\033[0m")
     print(f"  \033[2m● Naive Task Manager Sum (RSS):     {stats['total_rss_mb']} MB\033[0m")
     print(f"  \033[1;34m● steam-cef.slice Cgroup:            {stats['cef_cgroup_mb']} MB\033[0m")
     print(f"  \033[1;35m● steam-daemon.slice Cgroup:         {stats['daemon_cgroup_mb']} MB\033[0m\n")
