@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+
+# Preserve Millennium runtime path if present
+if [[ -f "${HOME}/.local/lib/millennium/libmillennium_x86.so" ]]; then
+    export MILLENNIUM_RUNTIME_PATH="${HOME}/.local/lib/millennium/libmillennium_x86.so"
+fi
+
+REAL_STEAM="/usr/bin/steam"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -x "${SCRIPT_DIR}/steam-tui-backend" ]]; then
+    BACKEND="${SCRIPT_DIR}/steam-tui-backend"
+else
+    BACKEND="$HOME/.local/bin/steam-tui-backend"
+fi
+
+# Auto-recover from stale Steam FIFO pipes and PID locks
+STEAM_PID_FILE="${HOME}/.steam/steam.pid"
+STEAM_PIPE_FILE="${HOME}/.steam/steam.pipe"
+if [[ -f "$STEAM_PID_FILE" ]]; then
+    OLD_PID=$(cat "$STEAM_PID_FILE" 2>/dev/null)
+    if [[ -n "$OLD_PID" ]] && ! kill -0 "$OLD_PID" 2>/dev/null; then
+        rm -f "$STEAM_PID_FILE" "$STEAM_PIPE_FILE" "${HOME}/.local/share/Steam/steam.pid" "${HOME}/.local/share/Steam/steam.pipe"
+    fi
+elif [[ -p "$STEAM_PIPE_FILE" ]]; then
+    if ! pgrep -u "$USER" -x "steam" >/dev/null 2>&1; then
+        rm -f "$STEAM_PIPE_FILE" "${HOME}/.local/share/Steam/steam.pipe"
+    fi
+fi
+
+# 1. Passthrough: Explicit GUI launch
+if [[ "$1" == "--gui" || "$1" == "-gui" ]]; then
+    exec "$BACKEND" --open-gui
+elif [[ $# -gt 0 ]]; then
+    exec "$REAL_STEAM" "$@"
+fi
+
+# 2. Check if running inside an interactive terminal (e.g. launched from Rofi / application menu)
+if [[ ! -t 0 || ! -t 1 ]]; then
+    exec "$BACKEND" --open-gui
+fi
+
+# 3. Active Session Check: If a game is already running, show persistent dashboard first!
+if "$BACKEND" --has-running; then
+    "$BACKEND" --dashboard
+    DASH_STATUS=$?
+    # Exit code 2 means user pressed 'b' to browse library
+    if [[ $DASH_STATUS -ne 2 ]]; then
+        exit 0
+    fi
+fi
+
+# 4. Interactive Library & Persistent Session Loop
+while true; do
+    GAME_LIST=$("$BACKEND" --list)
+
+    if [[ -z "$GAME_LIST" ]]; then
+        echo "No Steam games found. Starting native Steam client..."
+        exec "$REAL_STEAM"
+    fi
+
+    # Run fzf with Kitty-optimized styling and preview pane
+    SELECTED=$(echo "$GAME_LIST" | fzf \
+        --delimiter=$'\t' \
+        --with-nth=1 \
+        --ansi \
+        --header="[ENTER] Launch/Monitor | [Ctrl+R] Sync Library Cache | [ESC] Exit" \
+        --preview="$BACKEND --preview {2} {3}" \
+        --preview-window=right:45%:wrap \
+        --bind="ctrl-r:reload($BACKEND --sync >/dev/null 2>&1 && $BACKEND --list)" \
+        --height=85% \
+        --reverse)
+
+    if [[ -z "$SELECTED" ]]; then
+        exit 0
+    fi
+
+    APPID=$(echo "$SELECTED" | awk -F'\t' '{print $2}' | tr -d '\r\n')
+    STATUS=$(echo "$SELECTED" | awk -F'\t' '{print $3}' | tr -d '\r\n')
+    NAME=$(echo "$SELECTED" | awk -F'\t' '{print $1}' | sed -E 's/\x1b\[[0-9;]*m//g' | sed 's/^\[.*\] *//')
+
+    if [[ "$STATUS" == "AVAILABLE" ]]; then
+        read -r -p "Install $NAME via Steam? [y/N] " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            notify-send "Steam" "Beginning installation for $NAME..." -i steam 2>/dev/null || true
+            nohup "$REAL_STEAM" "steam://install/$APPID" >/dev/null 2>&1 &
+        else
+            echo "Installation cancelled."
+        fi
+        continue
+    fi
+
+    # Persistent Launch & Session Monitor!
+    # Handles update progress bar, background shader compilation, and live game session dashboard.
+    "$BACKEND" --launch-and-monitor "$APPID"
+
+    echo ""
+    read -r -p "Return to Game Library? [Y/n] " ret
+    if [[ "$ret" =~ ^[Nn]$ ]]; then
+        break
+    fi
+done

@@ -1,0 +1,868 @@
+#!/usr/bin/env python3
+"""
+Steam Terminal UI (TUI) Backend
+Manages Steam library discovery, owned games caching, fzf formatting, and previews.
+"""
+
+import sys
+import os
+import re
+import json
+import struct
+import glob
+import subprocess
+import shutil
+import urllib.request
+import urllib.parse
+from datetime import datetime
+
+STEAM_ROOT = os.path.expanduser("~/.local/share/Steam")
+CACHE_DIR = os.path.expanduser("~/.cache/steam_tui")
+CACHE_FILE = os.path.join(CACHE_DIR, "owned_cache.json")
+CONFIG_DIR = os.path.expanduser("~/.config/steam_tui")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.env")
+REAL_STEAM = "/usr/bin/steam"
+
+FILTER_KEYWORDS = [
+    "proton",
+    "steam linux runtime",
+    "steamworks common redistributables",
+    "steamvr",
+    "soundtrack",
+    "steam controller",
+    "shared depots",
+    "steam dedicated server",
+    "source sdk",
+    "steam client",
+    "winui2",
+]
+
+def load_config():
+    """Load configuration from ~/.config/steam_tui/config.env"""
+    cfg = {
+        "STEAM_API_KEY": "",
+        "STEAM_ID64": "",
+        "ENABLE_IMAGE_PREVIEW": "1",
+        "CHAFA_SIZE": "42x11",
+    }
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("\"'")
+                    cfg[k] = v
+        except Exception:
+            pass
+    return cfg
+
+def is_filtered(name, app_type="game"):
+    """Filter out runtime packages, tools, soundtracks, DLCs, and non-games."""
+    name_l = name.lower()
+    if any(k in name_l for k in FILTER_KEYWORDS):
+        return True
+    if app_type.lower() in ("tool", "config", "dlc", "music", "application", "hardware"):
+        return True
+    return False
+
+def get_library_folders():
+    """Discover all mounted Steam library paths across all drives."""
+    paths = {STEAM_ROOT}
+    vdf_path = os.path.join(STEAM_ROOT, "steamapps", "libraryfolders.vdf")
+    if os.path.isfile(vdf_path):
+        try:
+            with open(vdf_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            for m in re.finditer(r'\"path\"\s+\"([^\"]+)\"', content):
+                p = m.group(1).replace("\\\\", "/")
+                if os.path.isdir(p):
+                    paths.add(p)
+        except Exception:
+            pass
+    return sorted(list(paths))
+
+def parse_acf_file(manifest_path):
+    """Parse a single appmanifest_<appid>.acf file."""
+    try:
+        with open(manifest_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except Exception:
+        return None
+
+    appid_m = re.search(r'\"appid\"\s+\"(\d+)\"', content)
+    name_m = re.search(r'\"name\"\s+\"([^\"]+)\"', content)
+    if not appid_m or not name_m:
+        return None
+
+    appid = appid_m.group(1)
+    name = name_m.group(1)
+
+    installdir_m = re.search(r'\"installdir\"\s+\"([^\"]+)\"', content)
+    size_m = re.search(r'\"SizeOnDisk\"\s+\"(\d+)\"', content)
+    last_played_m = re.search(r'\"LastPlayed\"\s+\"(\d+)\"', content)
+
+    installdir = installdir_m.group(1) if installdir_m else ""
+    size = int(size_m.group(1)) if size_m else 0
+    last_played = int(last_played_m.group(1)) if last_played_m else 0
+
+    state_flags_m = re.search(r'\"StateFlags\"\s+\"(\d+)\"', content)
+    bytes_to_download_m = re.search(r'\"BytesToDownload\"\s+\"(\d+)\"', content)
+    bytes_downloaded_m = re.search(r'\"BytesDownloaded\"\s+\"(\d+)\"', content)
+    bytes_to_stage_m = re.search(r'\"BytesToStage\"\s+\"(\d+)\"', content)
+    bytes_staged_m = re.search(r'\"BytesStaged\"\s+\"(\d+)\"', content)
+
+    state_flags = int(state_flags_m.group(1)) if state_flags_m else 4
+    bytes_to_download = int(bytes_to_download_m.group(1)) if bytes_to_download_m else 0
+    bytes_downloaded = int(bytes_downloaded_m.group(1)) if bytes_downloaded_m else 0
+    bytes_to_stage = int(bytes_to_stage_m.group(1)) if bytes_to_stage_m else 0
+    bytes_staged = int(bytes_staged_m.group(1)) if bytes_staged_m else 0
+
+    return {
+        "appid": appid,
+        "name": name,
+        "installdir": installdir,
+        "size": size,
+        "last_played": last_played,
+        "manifest_path": manifest_path,
+        "state_flags": state_flags,
+        "bytes_to_download": bytes_to_download,
+        "bytes_downloaded": bytes_downloaded,
+        "bytes_to_stage": bytes_to_stage,
+        "bytes_staged": bytes_staged,
+    }
+
+def get_installed_games():
+    """Scan all library folders for installed games."""
+    installed = {}
+    for lib_path in get_library_folders():
+        steamapps_dir = os.path.join(lib_path, "steamapps")
+        if not os.path.isdir(steamapps_dir):
+            continue
+        for manifest_path in glob.glob(os.path.join(steamapps_dir, "appmanifest_*.acf")):
+            app = parse_acf_file(manifest_path)
+            if not app:
+                continue
+            if is_filtered(app["name"]):
+                continue
+            app["library"] = lib_path
+            app["install_path"] = os.path.join(steamapps_dir, "common", app["installdir"])
+            installed[app["appid"]] = app
+    return installed
+
+def parse_appinfo_vdf():
+    """Parse Steam's local binary appinfo.vdf cache for app metadata."""
+    appinfo_path = os.path.join(STEAM_ROOT, "appcache", "appinfo.vdf")
+    apps = {}
+    if not os.path.isfile(appinfo_path):
+        return apps
+
+    try:
+        with open(appinfo_path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return apps
+
+    offset = 8
+    raw_len = len(raw)
+    while offset < raw_len - 4:
+        appid = struct.unpack("<I", raw[offset:offset+4])[0]
+        if appid == 0:
+            break
+        size = struct.unpack("<I", raw[offset+4:offset+8])[0]
+        chunk = raw[offset:offset+size+8]
+        offset += size + 8
+
+        # Extract name using KeyValues token: \x01\x04\x00\x00\x00<name>\x00
+        m_name = re.search(b'\\x01\\x04\\x00\\x00\\x00([^\\x00]+)\\x00', chunk)
+        if m_name:
+            name = m_name.group(1).decode("utf-8", errors="replace")
+            m_type = re.search(b'\\x01\\x05\\x00\\x00\\x00([^\\x00]+)\\x00', chunk)
+            app_type = m_type.group(1).decode("utf-8", errors="replace") if m_type else "game"
+            apps[str(appid)] = {"name": name, "type": app_type}
+
+    return apps
+
+def load_owned_cache():
+    """Load cached owned games from ~/.cache/steam_tui/owned_cache.json."""
+    if not os.path.isfile(CACHE_FILE):
+        return {}
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data.get("apps", data)
+    except Exception:
+        pass
+    return {}
+
+def save_owned_cache(owned_games):
+    """Save owned games to ~/.cache/steam_tui/owned_cache.json."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_payload = {
+        "last_synced": int(datetime.now().timestamp()),
+        "apps": owned_games,
+    }
+    tmp_file = CACHE_FILE + ".tmp"
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(cache_payload, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_file, CACHE_FILE)
+    except Exception as e:
+        if os.path.exists(tmp_file):
+            try:
+                os.remove(tmp_file)
+            except Exception:
+                pass
+        sys.stderr.write(f"Error saving owned cache: {e}\n")
+
+def fetch_store_app_name(appid):
+    """Fallback query to Steam Store API for a single app name."""
+    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic"
+    req = urllib.request.Request(url, headers={"User-Agent": "steam-tui/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            entry = data.get(str(appid), {})
+            if entry.get("success") and "data" in entry:
+                app_data = entry["data"]
+                return app_data.get("name"), app_data.get("type", "game")
+    except Exception:
+        pass
+    return None, None
+
+def sync_library():
+    """Perform a full synchronization of owned and installed games."""
+    config = load_config()
+    existing_cache = load_owned_cache()
+    owned_games = dict(existing_cache) if existing_cache else {}
+
+    # 1. Check Steam Web API if credentials are provided in config.env
+    api_key = config.get("STEAM_API_KEY")
+    steam_id64 = config.get("STEAM_ID64")
+    if api_key and steam_id64:
+        try:
+            url = (
+                f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/"
+                f"?key={api_key}&steamid={steam_id64}&include_appinfo=1&include_played_free_games=1&format=json"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "steam-tui/1.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                res = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                games_list = res.get("response", {}).get("games", [])
+                for g in games_list:
+                    aid = str(g.get("appid"))
+                    nm = g.get("name", "")
+                    if aid and nm and not is_filtered(nm):
+                        owned_games[aid] = {"name": nm, "type": "game"}
+        except Exception as e:
+            sys.stderr.write(f"Web API sync failed, falling back to local scan: {e}\n")
+
+    # 2. Local Discovery: Harvest AppIDs from localconfig.vdf, appcache, and librarycache
+    candidate_appids = set()
+
+    for lconf in glob.glob(os.path.join(STEAM_ROOT, "userdata/*/config/localconfig.vdf")):
+        try:
+            with open(lconf, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+            for m in re.finditer(r'\"(\d{2,10})\"\s*\{', text):
+                candidate_appids.add(m.group(1))
+        except Exception:
+            pass
+
+    for d in glob.glob(os.path.join(STEAM_ROOT, "appcache/librarycache/*")):
+        base = os.path.basename(d)
+        if base.isdigit():
+            candidate_appids.add(base)
+
+    for j in glob.glob(os.path.join(STEAM_ROOT, "userdata/*/config/librarycache/*.json")):
+        base = os.path.splitext(os.path.basename(j))[0]
+        if base.isdigit():
+            candidate_appids.add(base)
+
+    # 3. Resolve names using local appinfo.vdf cache (instant, no network)
+    appinfo_apps = parse_appinfo_vdf()
+    for aid in candidate_appids:
+        if aid in appinfo_apps:
+            info = appinfo_apps[aid]
+            if not is_filtered(info["name"], info.get("type", "game")):
+                owned_games[aid] = info
+
+    # 4. Include currently installed games from all libraries
+    installed = get_installed_games()
+    for aid, app in installed.items():
+        if not is_filtered(app["name"]):
+            owned_games[aid] = {"name": app["name"], "type": "game"}
+
+    # 5. Clean up any filtered items from cache
+    owned_games = {
+        aid: info for aid, info in owned_games.items()
+        if not is_filtered(info.get("name", ""), info.get("type", "game"))
+    }
+
+    save_owned_cache(owned_games)
+    return owned_games
+
+def list_games():
+    """Output tab-delimited game list formatted for fzf."""
+    installed = get_installed_games()
+    owned = load_owned_cache()
+
+    # If cache is empty, run an initial fast sync
+    if not owned:
+        owned = sync_library()
+
+    output_lines = []
+
+    # 1. Installed games
+    installed_sorted = sorted(
+        installed.values(),
+        key=lambda x: x["name"].lower()
+    )
+    for app in installed_sorted:
+        sf = app.get("state_flags", 4)
+        if sf & 1024:
+            display_label = f"\033[1;36m[UPDATING]\033[0m    {app['name']}"
+            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATING")
+        elif sf & 2:
+            display_label = f"\033[1;33m[UPDATE]\033[0m      {app['name']}"
+            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATE_REQUIRED")
+        else:
+            display_label = f"\033[1;32m[INSTALLED]\033[0m   {app['name']}"
+            output_lines.append(f"{display_label}\t{app['appid']}\tINSTALLED")
+
+    # 2. Available (Uninstalled Owned) games
+    installed_ids = set(installed.keys())
+    available = []
+    for aid, info in owned.items():
+        if aid not in installed_ids:
+            name = info.get("name", f"App {aid}")
+            available.append({"appid": aid, "name": name})
+
+    available_sorted = sorted(
+        available,
+        key=lambda x: x["name"].lower()
+    )
+    for app in available_sorted:
+        display_label = f"\033[1;34m[AVAILABLE]\033[0m   {app['name']}"
+        output_lines.append(f"{display_label}\t{app['appid']}\tAVAILABLE")
+
+    return "\n".join(output_lines)
+
+def format_size(bytes_num):
+    """Format bytes into human-readable size."""
+    if bytes_num <= 0:
+        return "Unknown"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if bytes_num < 1024.0:
+            return f"{bytes_num:.2f} {unit}"
+        bytes_num /= 1024.0
+    return f"{bytes_num:.2f} PB"
+
+def show_preview(appid, status=None):
+    """Display clean Kitty-formatted metadata and optional chafa thumbnail."""
+    config = load_config()
+    installed = get_installed_games()
+    is_installed = str(appid) in installed
+
+    if is_installed:
+        app_meta = installed[str(appid)]
+        title = app_meta["name"]
+    else:
+        owned = load_owned_cache()
+        if str(appid) in owned:
+            title = owned[str(appid)].get("name", f"App {appid}")
+        else:
+            title = f"Steam App {appid}"
+
+    # Render image preview with Chafa if available
+    if config.get("ENABLE_IMAGE_PREVIEW", "1") == "1" and shutil.which("chafa"):
+        img_candidates = [
+            os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "header.jpg"),
+            os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "library_600x900.jpg"),
+        ]
+        chosen_img = next((img for img in img_candidates if os.path.isfile(img)), None)
+        if chosen_img:
+            size_arg = config.get("CHAFA_SIZE", "42x11")
+            try:
+                subprocess.run(
+                    ["chafa", "-f", "symbols", "--size", size_arg, chosen_img],
+                    check=False
+                )
+                print()
+            except Exception:
+                pass
+
+    print(f"\033[1mTitle:\033[0m   {title}")
+    print(f"\033[1mAppID:\033[0m   {appid}")
+
+    if is_installed:
+        app_meta = installed[str(appid)]
+        sf = app_meta.get("state_flags", 4)
+        if sf & 1024:
+            b_dl = app_meta.get("bytes_downloaded", 0)
+            b_to = app_meta.get("bytes_to_download", 0)
+            print(f"\033[1mStatus:\033[0m  \033[1;36m◐ Updating in background ({format_size(b_dl)} / {format_size(b_to)})\033[0m")
+        elif sf & 2:
+            b_to = app_meta.get("bytes_to_download", 0)
+            print(f"\033[1mStatus:\033[0m  \033[1;33m▲ Update Required ({format_size(b_to)} pending)\033[0m")
+        else:
+            print(f"\033[1mStatus:\033[0m  \033[1;32m● Installed (Ready to play)\033[0m")
+
+        if app_meta.get("library"):
+            print(f"\033[1mLibrary:\033[0m {app_meta['library']}")
+        if app_meta.get("install_path"):
+            print(f"\033[1mPath:\033[0m    {app_meta['install_path']}")
+        if app_meta.get("size"):
+            print(f"\033[1mSize:\033[0m    {format_size(app_meta['size'])}")
+        if app_meta.get("last_played"):
+            dt = datetime.fromtimestamp(app_meta["last_played"])
+            print(f"\033[1mPlayed:\033[0m  {dt.strftime('%Y-%m-%d %H:%M')}")
+        print()
+        if sf & (2 | 1024):
+            print("\033[1;33mAction: Press <ENTER> to track update in terminal & launch.\033[0m")
+        else:
+            print("\033[1;36mAction: Press <ENTER> to launch silently.\033[0m")
+    else:
+        print(f"\033[1mStatus:\033[0m  \033[1;34m○ Uninstalled (Available in library)\033[0m")
+        print()
+        print("\033[1;33mAction: Press <ENTER> to open Steam download prompt.\033[0m")
+
+def launch_app(appid):
+    """Launch an installed application silently."""
+    cmd = [REAL_STEAM, "-silent", "-applaunch", str(appid)]
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+def install_app(appid):
+    """Trigger Steam's native installation sequence."""
+    cmd = [REAL_STEAM, f"steam://install/{appid}"]
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+def track_update(appid):
+    """Update and track download progress in the terminal without opening Steam GUI."""
+    import time
+    installed = get_installed_games()
+    app = installed.get(str(appid))
+    name = app["name"] if app else f"App {appid}"
+    manifest_path = app["manifest_path"] if app else None
+
+    if not manifest_path or not os.path.isfile(manifest_path):
+        sys.stderr.write(f"Error: Manifest not found for AppID {appid}\n")
+        sys.exit(1)
+
+    # 1. Ensure Steam daemon is running in background silently
+    try:
+        res = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL)
+        if res.returncode != 0:
+            print("\033[1;34mStarting background Steam daemon...\033[0m")
+            subprocess.Popen([REAL_STEAM, "-silent"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            time.sleep(2)
+    except Exception:
+        pass
+
+    # 2. Trigger Steam update/download sequence for appid
+    subprocess.run([REAL_STEAM, f"steam://install/{appid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    print(f"\n\033[1;36mTracking update for {name} (AppID: {appid})...\033[0m")
+    print("\033[2m[Ctrl+C] to detach (update continues in background)\033[0m\n")
+
+    last_bytes = 0
+    last_time = time.time()
+    speed_mb_s = 0.0
+
+    try:
+        while True:
+            acf = parse_acf_file(manifest_path)
+            if not acf:
+                time.sleep(0.8)
+                continue
+
+            sf = acf["state_flags"]
+            dl = acf["bytes_downloaded"]
+            to_dl = acf["bytes_to_download"]
+            st = acf["bytes_staged"]
+            to_st = acf["bytes_to_stage"]
+
+            now = time.time()
+            dt = now - last_time
+            if dt >= 1.0:
+                delta_bytes = max(0, dl - last_bytes)
+                speed_mb_s = (delta_bytes / (1024 * 1024)) / dt
+                last_bytes = dl
+                last_time = now
+
+            # If update completed (StateFlags == 4 and not updating/update_required)
+            if sf == 4 or (not (sf & 2) and not (sf & 1024) and dl >= to_dl and to_dl > 0):
+                print(f"\r\033[K\033[1;32m✔ Update complete! ({format_size(to_dl)})\033[0m\n")
+                subprocess.run(["notify-send", "Steam (Headless)", f"Update complete for {name}. Launching...", "-i", "steam"], check=False)
+                launch_app(appid)
+                sys.exit(0)
+
+            # Determine stage and progress
+            if to_dl > 0:
+                pct = min(100.0, (dl / to_dl) * 100.0)
+            elif to_st > 0:
+                pct = min(100.0, (st / to_st) * 100.0)
+            else:
+                pct = 0.0
+
+            bar_len = 30
+            filled = int(bar_len * pct / 100.0)
+            bar = "█" * filled + "░" * (bar_len - filled)
+
+            eta_str = ""
+            if speed_mb_s > 0.05 and to_dl > dl:
+                rem_sec = int((to_dl - dl) / (speed_mb_s * 1024 * 1024))
+                eta_str = f"| ETA: {rem_sec}s"
+
+            if sf & 1024:
+                status_txt = "Downloading"
+            elif st > 0 and st < to_st:
+                status_txt = "Staging"
+            elif sf & 512:
+                status_txt = "Paused"
+            else:
+                status_txt = "Queued"
+
+            progress_line = (
+                f"\r\033[K[{bar}] {pct:5.1f}% | {format_size(dl)} / {format_size(to_dl)} "
+                f"| {speed_mb_s:5.1f} MB/s {eta_str} | {status_txt}"
+            )
+            sys.stdout.write(progress_line)
+            sys.stdout.flush()
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\n\n\033[1;33mTracking detached. Background update continues in Steam.\033[0m")
+        sys.exit(0)
+
+def get_running_steam_game():
+    """Detect any actively running Steam game on Hyprland / system."""
+    try:
+        out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
+        clients = json.loads(out)
+        installed = get_installed_games()
+        for c in clients:
+            cls = c.get('class', '')
+            if cls.startswith('steam_app_'):
+                aid = cls.replace('steam_app_', '')
+                pid = c.get('pid')
+                title = c.get('title')
+                name = installed.get(aid, {}).get('name', title)
+
+                # Fetch process stats
+                cpu, mem, etime = '0.0', '0.0', '00:00'
+                try:
+                    ps_out = subprocess.check_output(['ps', '-p', str(pid), '-o', '%cpu,%mem,etime'], stderr=subprocess.DEVNULL).decode('utf-8').strip().split('\n')
+                    if len(ps_out) > 1:
+                        parts = ps_out[1].split()
+                        cpu, mem, etime = parts[0], parts[1], parts[2]
+                except Exception:
+                    pass
+
+                # Fetch VRAM if nvidia-smi available
+                vram = "N/A"
+                try:
+                    smi_out = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'], stderr=subprocess.DEVNULL).decode('utf-8')
+                    for line in smi_out.strip().split('\n'):
+                        if str(pid) in line:
+                            vram_mb = line.split(',')[1].strip()
+                            vram = f"{int(vram_mb) / 1024:.1f} GB"
+                except Exception:
+                    pass
+
+                return {
+                    'appid': aid,
+                    'name': name,
+                    'title': title,
+                    'pid': pid,
+                    'workspace': c.get('workspace', {}).get('name', 'N/A'),
+                    'cpu': cpu,
+                    'mem': mem,
+                    'etime': etime,
+                    'vram': vram,
+                }
+    except Exception:
+        pass
+    return None
+
+def show_dashboard():
+    """Persistent dashboard for actively running Steam game session."""
+    import select
+    import termios
+    import tty
+
+    game = get_running_steam_game()
+    if not game:
+        print("No active Steam game is currently running.")
+        return 1
+
+    old_settings = None
+    if sys.stdin.isatty():
+        old_settings = termios.tcgetattr(sys.stdin)
+
+    try:
+        if old_settings:
+            tty.setcbreak(sys.stdin.fileno())
+
+        while True:
+            game = get_running_steam_game()
+            if not game:
+                sys.stdout.write("\r\033[K\n\033[1;32m✔ Active game session has finished.\033[0m\n\n")
+                sys.stdout.flush()
+                return 0
+
+            lines = [
+                "\033[H\033[J",
+                "\033[1;36m╔══════════════════════════════════════════════════════════════════════╗\033[0m",
+                "\033[1;36m║\033[0m  \033[1;35m󰓓  STEAM HEADLESS CLI\033[0m \033[2m│\033[0m \033[1;32mActive Game Session\033[0m                     \033[1;36m║\033[0m",
+                "\033[1;36m╠══════════════════════════════════════════════════════════════════════╣\033[0m",
+                f"\033[1;36m║\033[0m  \033[1mGame:\033[0m        \033[1;37m{game['name'][:42]:<42}\033[0m \033[2m(AppID: {game['appid']})\033[0m",
+                f"\033[1;36m║\033[0m  \033[1mProcess:\033[0m     PID \033[1;33m{game['pid']}\033[0m \033[2m│\033[0m Workspace: \033[1;34m{game['workspace']}\033[0m",
+                f"\033[1;36m║\033[0m  \033[1mRuntime:\033[0m     \033[1;32m{game['etime']}\033[0m \033[2m│\033[0m CPU: \033[1;33m{game['cpu']}%\033[0m \033[2m│\033[0m RAM: \033[1;33m{game['mem']}%\033[0m \033[2m│\033[0m VRAM: \033[1;33m{game['vram']}\033[0m",
+                f"\033[1;36m║\033[0m  \033[1mSteam GUI:\033[0m   \033[1;32mDetached & Isolated\033[0m \033[2m(Running headless in special:silent)\033[0m",
+                "\033[1;36m╠══════════════════════════════════════════════════════════════════════╣\033[0m",
+                "\033[1;36m║\033[0m  \033[1;33m[b]\033[0m Browse Library    \033[1;31m[k]\033[0m Terminate Game    \033[1;37m[q / Esc]\033[0m Detach & Exit   \033[1;36m║\033[0m",
+                "\033[1;36m╚══════════════════════════════════════════════════════════════════════╝\033[0m",
+            ]
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+
+            if sys.stdin.isatty():
+                r, _, _ = select.select([sys.stdin], [], [], 1.0)
+                if r:
+                    key = sys.stdin.read(1)
+                    if key in ('q', '\x1b'):
+                        return 0
+                    elif key == 'b':
+                        return 2
+                    elif key == 'k':
+                        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                        sys.stdout.write(f"\n\033[1;31mTerminate {game['name']} (PID: {game['pid']})? [y/N]: \033[0m")
+                        sys.stdout.flush()
+                        ans = sys.stdin.readline().strip().lower()
+                        if ans == 'y':
+                            try:
+                                subprocess.run(['kill', '-TERM', str(game['pid'])], check=False)
+                                sys.stdout.write(f"\033[1;32mSignal sent to terminate {game['name']}.\033[0m\n")
+                                sys.stdout.flush()
+                            except Exception as e:
+                                sys.stdout.write(f"\033[1;31mError killing process: {e}\033[0m\n")
+                            return 0
+                        tty.setcbreak(sys.stdin.fileno())
+            else:
+                time.sleep(1.0)
+    finally:
+        if old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+def launch_and_monitor(appid):
+    """Launch game silently, track update/shaders if needed, and monitor session persistently."""
+    import time
+    installed = get_installed_games()
+    app = installed.get(str(appid))
+    name = app["name"] if app else f"App {appid}"
+    manifest_path = app["manifest_path"] if app else None
+
+    # 1. Update check
+    if manifest_path and os.path.isfile(manifest_path):
+        acf = parse_acf_file(manifest_path)
+        if acf and (acf["state_flags"] & 2 or acf["state_flags"] & 1024):
+            print(f"\n\033[1;33mGame update required for {name} ({format_size(acf['bytes_to_download'])})\033[0m")
+            track_update(appid)
+
+    # 2. Ensure Steam daemon is running headless
+    try:
+        res = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL)
+        if res.returncode != 0:
+            print("\033[1;34mStarting Steam headless daemon in background...\033[0m")
+            subprocess.Popen([REAL_STEAM, "-silent"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            time.sleep(2)
+    except Exception:
+        pass
+
+    # 3. Trigger silent launch
+    print(f"\n\033[1;36mInitializing {name} (AppID: {appid})...\033[0m")
+    subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    subprocess.run(["notify-send", "Steam (Headless)", f"Launching {name}...", "-i", "steam"], check=False)
+
+    # 4. Wait for game process to appear
+    sys.stdout.write("Waiting for game runtime to attach...")
+    sys.stdout.flush()
+
+    for _ in range(40):
+        time.sleep(0.5)
+        foz = subprocess.run(["pgrep", "-f", "fossilize_replay"], stdout=subprocess.DEVNULL)
+        if foz.returncode == 0:
+            sys.stdout.write("\r\033[K\033[1;33m[Vulkan Shaders] Fossilize compiling pipelines in background...\033[0m")
+            sys.stdout.flush()
+
+        game = get_running_steam_game()
+        if game and (game['appid'] == str(appid) or str(appid) in game.get('title', '')):
+            break
+
+    # 5. Enter persistent dashboard monitor
+    show_dashboard()
+
+def cleanup_stale_steam_locks():
+    """Ensure dead steam.pid / steam.pipe FIFO locks don't hang Steam startups."""
+    pid_file = os.path.expanduser("~/.steam/steam.pid")
+    pipe_file = os.path.expanduser("~/.steam/steam.pipe")
+    if os.path.isfile(pid_file):
+        try:
+            with open(pid_file, "r") as f:
+                pid = int(f.read().strip())
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                for fpath in [pid_file, pipe_file, os.path.expanduser("~/.local/share/Steam/steam.pid"), os.path.expanduser("~/.local/share/Steam/steam.pipe")]:
+                    if os.path.exists(fpath):
+                        try:
+                            os.remove(fpath)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    elif os.path.exists(pipe_file):
+        res = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL)
+        if res.returncode != 0:
+            for fpath in [pipe_file, os.path.expanduser("~/.local/share/Steam/steam.pipe")]:
+                if os.path.exists(fpath):
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+
+def open_steam_gui():
+    """Explicitly bring Steam GUI window to the active workspace and focus it."""
+    import time
+    cleanup_stale_steam_locks()
+
+    def find_steam_window():
+        try:
+            out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
+            clients = json.loads(out)
+            for c in clients:
+                if c.get('class') == 'steam' and c.get('title') == 'Steam':
+                    return c.get('address')
+        except Exception:
+            pass
+        return None
+
+    # Get active workspace id
+    ws_id = "1"
+    try:
+        ws_out = subprocess.check_output(['hyprctl', '-j', 'activeworkspace'], stderr=subprocess.DEVNULL).decode('utf-8')
+        ws_id = str(json.loads(ws_out).get('id', 1))
+    except Exception:
+        pass
+
+    steam_addr = find_steam_window()
+    if steam_addr:
+        subprocess.run(['hyprctl', 'dispatch', 'movetoworkspace', f'{ws_id},address:{steam_addr}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['hyprctl', 'dispatch', 'focuswindow', f'address:{steam_addr}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"Steam GUI moved to workspace {ws_id} and focused.")
+        return
+
+    # If Steam is not running or window not mapped yet, launch it
+    print("Launching Steam GUI...")
+    cleanup_stale_steam_locks()
+    subprocess.Popen([REAL_STEAM], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(40):
+        time.sleep(0.5)
+        steam_addr = find_steam_window()
+        if steam_addr:
+            subprocess.run(['hyprctl', 'dispatch', 'movetoworkspace', f'{ws_id},address:{steam_addr}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['hyprctl', 'dispatch', 'focuswindow', f'address:{steam_addr}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"Steam GUI launched, moved to workspace {ws_id} and focused.")
+            return
+
+def print_help():
+    print("""Usage: steam-tui-backend [OPTION]
+
+Options:
+  --list                List all installed and owned games (fzf format)
+  --sync                Synchronize owned games cache from Steam data/API
+  --preview <id> [st]   Show game details and Kitty preview for AppID
+  --launch <id>         Launch installed game silently
+  --install <id>        Trigger Steam installation for AppID
+  --track-update <id>   Track update/download in terminal without opening Steam GUI
+  --dashboard           Show interactive session dashboard for running game
+  --has-running         Check if a Steam game is actively running (exit code 0/1)
+  --status              Print JSON status of running game
+  --launch-and-monitor <id> Launch game and persistently monitor session
+  --open-gui            Bring Steam GUI window to current workspace and focus
+  --help                Show this help message
+""")
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print_help()
+        sys.exit(0)
+
+    arg = sys.argv[1]
+    if arg == "--list":
+        out = list_games()
+        if out:
+            print(out)
+    elif arg == "--sync":
+        sync_library()
+        print("Sync complete.")
+    elif arg == "--preview":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --preview requires <appid>\n")
+            sys.exit(1)
+        appid = sys.argv[2]
+        status = sys.argv[3] if len(sys.argv) > 3 else None
+        show_preview(appid, status)
+    elif arg == "--launch":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --launch requires <appid>\n")
+            sys.exit(1)
+        launch_app(sys.argv[2])
+    elif arg == "--install":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --install requires <appid>\n")
+            sys.exit(1)
+        install_app(sys.argv[2])
+    elif arg == "--track-update":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --track-update requires <appid>\n")
+            sys.exit(1)
+        track_update(sys.argv[2])
+    elif arg == "--has-running":
+        game = get_running_steam_game()
+        sys.exit(0 if game else 1)
+    elif arg == "--dashboard":
+        code = show_dashboard()
+        sys.exit(code if code is not None else 0)
+    elif arg == "--status":
+        game = get_running_steam_game()
+        print(json.dumps(game, indent=2) if game else "null")
+    elif arg == "--launch-and-monitor":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --launch-and-monitor requires <appid>\n")
+            sys.exit(1)
+        launch_and_monitor(sys.argv[2])
+    elif arg == "--open-gui":
+        open_steam_gui()
+    else:
+        sys.stderr.write(f"Unknown argument: {arg}\n")
+        print_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

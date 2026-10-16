@@ -1,0 +1,11 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Cache and local runtime files
+.cache/
+*.log
+
+# Local user configs
+config.env
