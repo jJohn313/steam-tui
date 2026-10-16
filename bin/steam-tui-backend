@@ -14,6 +14,7 @@ import subprocess
 import shutil
 import urllib.request
 import urllib.parse
+import socket
 import signal
 from datetime import datetime
 
@@ -52,7 +53,7 @@ def get_steam_pss_mb():
     pids = set()
     for pattern in ["steam", "steamwebhelper"]:
         try:
-            out = subprocess.check_output(["pgrep", pattern], stderr=subprocess.DEVNULL).decode().split()
+            out = subprocess.check_output(["pgrep", "-x", pattern], stderr=subprocess.DEVNULL).decode().split()
             for p in out:
                 pids.add(p.strip())
         except Exception:
@@ -68,6 +69,41 @@ def get_steam_pss_mb():
         except Exception:
             pass
     return max(0, total_pss_kb // 1024)
+
+def cdp_send(ws_url, msg_dict):
+    """Send a one-shot JSON RPC message to a Chromium DevTools WebSocket endpoint."""
+    try:
+        p = urllib.parse.urlparse(ws_url)
+        host, port = p.hostname or "127.0.0.1", p.port or 8080
+        path = p.path
+        s = socket.create_connection((host, port), timeout=0.8)
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        s.sendall(req.encode("utf-8"))
+        resp = s.recv(1024)
+        if b"101" not in resp:
+            s.close()
+            return False
+        payload = json.dumps(msg_dict).encode("utf-8")
+        length = len(payload)
+        if length <= 125:
+            header = bytes([0x81, 0x80 | length, 0, 0, 0, 0])
+        elif length <= 65535:
+            header = bytes([0x81, 0x80 | 126, (length >> 8) & 0xff, length & 0xff, 0, 0, 0, 0])
+        else:
+            s.close()
+            return False
+        s.sendall(header + payload)
+        s.close()
+        return True
+    except Exception:
+        return False
 
 FILTER_KEYWORDS = [
     "proton",
@@ -907,6 +943,21 @@ def wait_for_steam_ready(timeout=25):
             time.sleep(0.5)
             continue
 
+        # Eager cgroup migration: charge steamwebhelper to steam-cef.slice from second zero
+        try:
+            uid = os.getuid()
+            cef_procs = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/steam-cef.slice/cgroup.procs"
+            if os.path.isfile(cef_procs):
+                res_cef = subprocess.run(["pgrep", "-x", "steamwebhelper"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                for pid in res_cef.stdout.decode().split():
+                    try:
+                        with open(cef_procs, "w") as f_proc:
+                            f_proc.write(f"{pid}\n")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         if os.path.exists(pipe_file) or os.path.exists(alt_pipe):
             if not pipe_detected:
                 pipe_detected = True
@@ -935,6 +986,18 @@ def wait_for_steam_ready(timeout=25):
 def start_headless_daemon():
     """Start Steam silently without full GUI overhead and block until IPC pipe & login are ready."""
     cleanup_stale_steam_locks()
+    # Pre-create steam-cef.slice so it is ready from second zero
+    uid = os.getuid()
+    cgroup_dir = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/steam-cef.slice"
+    try:
+        os.makedirs(cgroup_dir, exist_ok=True)
+        mem_high = os.path.join(cgroup_dir, "memory.high")
+        if os.path.isfile(mem_high):
+            with open(mem_high, "w") as f:
+                f.write("134217728\n")
+    except Exception:
+        pass
+
     res = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL)
     if res.returncode != 0:
         print("\033[1;34mStarting minimal Steam daemon...\033[0m")
@@ -1621,11 +1684,12 @@ def show_dashboard(target_appid=None):
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 def constrain_headless_cef():
-    """Surgical CEF memory reducer for headless mode:
+    """Surgical CEF and Steam daemon memory reducer for headless mode:
     1. Dedicated cgroup sub-slice for steamwebhelper PIDs only (MemoryHigh=128M, no MemoryMax).
     2. Moves all steamwebhelper PIDs (master root, zygotes, utilities) into steam-cef.slice.
-    3. Immediately recycles bloated non-SharedJSContext child renderers via CDP (127.0.0.1:8080/json).
-    4. Finds any --type=utility processes and triggers kernel memory.reclaim twice with 0.5s delay.
+    3. Navigates non-SharedJSContext targets to about:blank via CDP WebSocket and /json/close/{tid}.
+    4. Triggers kernel memory.reclaim on steam-cef.slice twice with 0.5s delay.
+    5. Moves 32-bit steam daemon into steam-daemon.slice and pages out cold startup heap (300M reclaim).
     """
     import urllib.request
     import json
@@ -1659,7 +1723,7 @@ def constrain_headless_cef():
     procs_file = os.path.join(cgroup_dir, "cgroup.procs")
     if os.path.isfile(procs_file):
         try:
-            res = subprocess.run(["pgrep", "steamwebhelper"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            res = subprocess.run(["pgrep", "-x", "steamwebhelper"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             cef_pids = res.stdout.decode("utf-8").strip().split()
             for pid in cef_pids:
                 try:
@@ -1670,7 +1734,7 @@ def constrain_headless_cef():
         except Exception:
             pass
 
-    # 3. Immediately recycle bloated non-SharedJSContext child renderers via CDP
+    # 3. Navigate non-SharedJSContext targets to about:blank via CDP WebSocket (releases React DOM)
     try:
         req = urllib.request.Request("http://127.0.0.1:8080/json", headers={"User-Agent": "steam-tui"})
         with urllib.request.urlopen(req, timeout=1.0) as resp:
@@ -1679,9 +1743,12 @@ def constrain_headless_cef():
                 title = t.get("title", "")
                 url = t.get("url", "")
                 tid = t.get("id")
+                ws = t.get("webSocketDebuggerUrl")
                 # Do NOT touch SharedJSContext (required for Steamworks DRM, Steam Input, Cloud Sync)
                 if "SharedJSContext" in title or "SharedJSContext" in url:
                     continue
+                if ws:
+                    cdp_send(ws, {"id": 1, "method": "Page.navigate", "params": {"url": "about:blank"}})
                 if tid:
                     try:
                         close_req = urllib.request.Request(f"http://127.0.0.1:8080/json/close/{tid}")
@@ -1717,6 +1784,40 @@ def constrain_headless_cef():
             except OSError:
                 pass
             time.sleep(0.5)
+
+    # 5. Reclaim cold startup heap (appinfo.vdf / package cache) from the 32-bit steam daemon process
+    try:
+        daemon_cgroup_dir = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/steam-daemon.slice"
+        os.makedirs(daemon_cgroup_dir, exist_ok=True)
+        d_mem_high = os.path.join(daemon_cgroup_dir, "memory.high")
+        if os.path.isfile(d_mem_high):
+            try:
+                with open(d_mem_high, "w") as f:
+                    f.write("max\n")
+            except Exception:
+                pass
+
+        d_procs_file = os.path.join(daemon_cgroup_dir, "cgroup.procs")
+        res_steam = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        steam_pids = res_steam.stdout.decode("utf-8").strip().split()
+        if os.path.isfile(d_procs_file) and steam_pids:
+            for spid in steam_pids:
+                try:
+                    with open(d_procs_file, "w") as f:
+                        f.write(f"{spid}\n")
+                except Exception:
+                    pass
+
+        # Write 300M (314572800) to memory.reclaim to page out cold startup tables
+        d_reclaim_file = os.path.join(daemon_cgroup_dir, "memory.reclaim")
+        if os.path.isfile(d_reclaim_file):
+            try:
+                with open(d_reclaim_file, "w") as f:
+                    f.write("314572800\n")
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 def launch_and_monitor(appid, shortcut_id=None):
     """Launch game silently, track update/shaders if needed, and monitor session persistently."""
