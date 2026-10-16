@@ -34,9 +34,9 @@ elif [[ $# -gt 0 ]]; then
     exec "$REAL_STEAM" "$@"
 fi
 
-# 2. Check if running inside an interactive terminal (e.g. launched from Rofi / application menu)
+# 2. If non-interactive (no TTY) and no args: pass straight to REAL_STEAM so background scripts don't trigger --open-gui's -shutdown!
 if [[ ! -t 0 || ! -t 1 ]]; then
-    exec "$BACKEND" --open-gui
+    exec "$REAL_STEAM" "$@"
 fi
 
 # 3. Active Session Check: If a game is already running, show persistent dashboard first!

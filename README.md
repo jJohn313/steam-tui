@@ -8,9 +8,9 @@ Intercepts interactive terminal calls to `steam` to deliver an instantaneous, ke
 
 ## ⚡ Highlights
 
-- **Zero CEF / ~80MB Daemon Footprint**: Starts Steam with `-no-browser`, `-nofriendsui`, and `-vgui` to eliminate the ~1GB Chromium Embedded Framework (`steamwebhelper`) overhead while retaining full Steamworks DRM, cloud saves, and socket support.
+- **Minimal Daemon Footprint**: Starts Steam silently with `-silent`, `-nofriendsui`, and `-nochatui` to suppress window mapping and chat CEF overhead while maintaining Steamworks DRM, cloud saves, and socket support.
 - **Automatic GUI RAM Reclamation**: Running `steam --gui` launches the full Store/Community client, monitors the Hyprland window lifecycle, and automatically shuts down CEF processes when the window is closed to immediately recover 1GB+ of system memory.
-- **Headless Terminal Installation & EULA Bypass**: Installs games directly from terminal via Steam internal console commands (`+app_install <appid> <lib_idx>`), bypassing GUI prompts, multi-step install modals, and EULA blocks.
+- **Headless Terminal Installation & EULA Bypass**: Installs games directly from terminal via bootstrap ACF manifests and `steam://install/<appid>`, bypassing GUI prompts, multi-step install modals, and EULA blocks.
 - **Interactive Multi-Drive Target Selector**: Prompts for target library destination when installing across multiple mounted drives with free disk space statistics.
 - **Real-Time Speed & Progress Tracking**: Reads live download throughput directly from Steam's `content_log.txt` (with ACF fallback), computing ETA and staging states.
 - **Non-Steam Games & Modded Shortcuts**: Parses binary `shortcuts.vdf` to seamlessly integrate custom executables and modded wrappers into your library, computing 64-bit shortcut IDs to launch via Proton alongside native titles.
