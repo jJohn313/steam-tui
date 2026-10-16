@@ -13,9 +13,16 @@ Intercepts interactive terminal calls to `steam` to deliver an instantaneous, ke
 - **Headless Terminal Installation & EULA Bypass**: Installs games directly from terminal via Steam internal console commands (`+app_install <appid> <lib_idx>`), bypassing GUI prompts, multi-step install modals, and EULA blocks.
 - **Interactive Multi-Drive Target Selector**: Prompts for target library destination when installing across multiple mounted drives with free disk space statistics.
 - **Real-Time Speed & Progress Tracking**: Reads live download throughput directly from Steam's `content_log.txt` (with ACF fallback), computing ETA and staging states.
-- **Pixel-Perfect Kitty Terminal Art**: Renders true-color box art directly in Kitty via `chafa -f kitty` or `kitten icat`, with instant canvas clearing to eliminate ghosting during rapid scrolling.
+- **Non-Steam Games & Modded Shortcuts**: Parses binary `shortcuts.vdf` to seamlessly integrate custom executables and modded wrappers into your library, computing 64-bit shortcut IDs to launch via Proton alongside native titles.
+- **In-TUI Launch Options Editor (`Ctrl-O`)**: Reads and edits `LaunchOptions` (e.g. `gamemoderun %command%` or `PROTON_ENABLE_NVAPI=1 %command%`) directly in `localconfig.vdf` without opening the GUI.
+- **Proton Version & Compatibility Selector (`Ctrl-P`)**: Scans system and user compatibility directories (Proton Experimental, GE-Proton, Proton Hotfix, etc.) and writes per-game mappings into `config.vdf`.
+- **Direct Prefix & Save-Data Manager (`Ctrl-F`)**: Instant shortcut menu to open game directories, browse Proton prefixes (`drive_c`), jump to Windows `AppData` save paths, or launch `winecfg`.
+- **Cloud Sync & Runtime Preview**: Previews show Proton compatibility tool mapping and last Cloud save synchronization timestamp.
+- **Robust v28/v29 Binary `appinfo.vdf` Parser**: Handles Steam client schema changes (16-byte headers, 68-byte entry headers, and string table index resolution) for instantaneous name and metadata lookups with zero network calls.
+- **Process Group Termination**: Terminating a game signals the entire process group and reaper tree (`AppId=<appid>`), preventing hanging wineserver or anti-cheat helpers.
+- **Pixel-Perfect Kitty Terminal Art**: Renders true-color box art directly in Kitty via `chafa -f kitty` or `kitten icat`, with automatic fallback to Steam CDN caching for uninstalled titles.
 - **Live Session Dashboard & HUD**: Tracks running game sessions with real-time CPU, RAM, VRAM, and runtime metrics, providing interactive controls:
-  - `k`: Terminate game process cleanly
+  - `k`: Terminate game process group cleanly
   - `b`: Return to library browser while game continues in background
   - `q`: Detach monitor and exit terminal
 - **Terminal Uninstallation**: Press `Ctrl-X` inside `fzf` to cleanly dispatch `+app_uninstall` without touching the GUI.
@@ -82,19 +89,22 @@ steam -silent -applaunch 730
 
 | Keybinding | Action |
 | :--- | :--- |
-| `<ENTER>` | **Installed Game**: Launches game and opens live session tracker.<br>**Available Game**: Triggers terminal install with drive selector and EULA bypass. |
-| `<Ctrl+I>` | Filters view to display **Installed / Updating games only**. |
-| `<Ctrl+A>` | Resets filter to show **All games** (installed + uninstalled). |
+| `<ENTER>` | **Installed Game**: Launches game and opens live session tracker.<br>**Shortcut**: Launches non-Steam shortcut via Proton.<br>**Available Game**: Triggers terminal install with drive selector and EULA bypass. |
+| `<Ctrl+I>` | Filters view to display **Installed, Updating, & Shortcut games only**. |
+| `<Ctrl+A>` | Resets filter to show **All games** (installed + uninstalled + shortcuts). |
+| `<Ctrl+O>` | Opens inline editor for per-game **Launch Options** (`localconfig.vdf`). |
+| `<Ctrl+P>` | Selects Proton / GE-Proton **Compatibility Tool** (`config.vdf`). |
+| `<Ctrl+F>` | Opens **Prefix & Files Menu** (game dir, prefix `drive_c`, `AppData`, `winecfg`). |
 | `<Ctrl+X>` | Prompts to **Uninstall selected game** directly from terminal. |
 | `<Ctrl+R>` | Rescans library drives, parses manifests, refreshes cache, and live-reloads list. |
 | `<ESC>` / `<Ctrl+C>` | Exits launcher without starting Steam. |
-| `Type to Filter` | Real-time fuzzy search across installed and owned games. |
+| `Type to Filter` | Real-time fuzzy search across installed, shortcut, and owned games. |
 
 ### Controls in Live Session HUD
 
 | Key | Action |
 | :--- | :--- |
-| `k` | Cleanly terminates the active game process. |
+| `k` | Cleanly terminates the active game process group and Proton runtimes. |
 | `b` | Keeps game running in background and returns to library browser. |
 | `q` | Detaches monitor and returns to terminal prompt. |
 
@@ -114,8 +124,17 @@ steam-tui-backend --sync
 # Render preview card for specific AppID
 steam-tui-backend --preview 1091500 INSTALLED
 
-# Launch and attach persistent monitor to AppID
+# Launch and attach persistent monitor to AppID or Shortcut ID
 steam-tui-backend --launch-and-monitor 1091500
+
+# Open interactive launch options editor
+steam-tui-backend --edit-launch-options 1091500
+
+# Open interactive Proton compatibility tool selector
+steam-tui-backend --set-proton 1091500
+
+# Open prefix and files navigation menu
+steam-tui-backend --files-menu 1091500
 
 # Open live dashboard for already-running game
 steam-tui-backend --dashboard

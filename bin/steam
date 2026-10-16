@@ -71,12 +71,15 @@ while true; do
         --prompt=" Search ❯ " \
         --pointer="▶" \
         --color="bg+:#1e1e2e,fg+:#cdd6f4,hl:#f38ba8,hl+:#f38ba8,border:#89b4fa,label:#89b4fa,prompt:#cba6f7,pointer:#f5e0dc,header:#6c7086" \
-        --header="ENTER: Launch/Install │ Ctrl-I: Installed Only │ Ctrl-A: All │ Ctrl-X: Uninstall │ Ctrl-R: Sync" \
+        --header="ENTER: Launch │ Ctrl-I: Installed │ Ctrl-A: All │ Ctrl-O: Launch Options │ Ctrl-P: Proton │ Ctrl-F: Prefix/Files │ Ctrl-X: Uninstall" \
         --preview="$BACKEND --preview {2} {3}" \
         --preview-window="right:48%:border-left:wrap" \
         --bind="ctrl-r:reload($BACKEND --sync >/dev/null 2>&1 && $BACKEND --list)" \
-        --bind="ctrl-i:reload($BACKEND --list | grep -E 'INSTALLED|UPDATE')" \
+        --bind="ctrl-i:reload($BACKEND --list | grep -E 'INSTALLED|UPDATE|SHORTCUT')" \
         --bind="ctrl-a:reload($BACKEND --list)" \
+        --bind="ctrl-o:execute($BACKEND --edit-launch-options {2})+reload($BACKEND --list)" \
+        --bind="ctrl-p:execute($BACKEND --set-proton {2})+reload($BACKEND --list)" \
+        --bind="ctrl-f:execute($BACKEND --files-menu {2})" \
         --bind="ctrl-x:execute($BACKEND --uninstall {2})+reload($BACKEND --list)" \
         --height=92%)
 
@@ -86,7 +89,13 @@ while true; do
 
     APPID=$(echo "$SELECTED" | awk -F'\t' '{print $2}' | tr -d '\r\n')
     STATUS=$(echo "$SELECTED" | awk -F'\t' '{print $3}' | tr -d '\r\n')
+    SHORTCUT_ID=$(echo "$SELECTED" | awk -F'\t' '{print $4}' | tr -d '\r\n')
     NAME=$(echo "$SELECTED" | awk -F'\t' '{print $1}' | sed -E 's/\x1b\[[0-9;]*m//g' | sed 's/^\[.*\] *//')
+
+    if [[ "$STATUS" == "SHORTCUT" ]]; then
+        "$BACKEND" --launch-and-monitor "$APPID" "$SHORTCUT_ID"
+        continue
+    fi
 
     if [[ "$STATUS" == "AVAILABLE" ]]; then
         read -r -p "Install $NAME in terminal? [y/N] " confirm

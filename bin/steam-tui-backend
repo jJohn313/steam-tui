@@ -14,6 +14,7 @@ import subprocess
 import shutil
 import urllib.request
 import urllib.parse
+import signal
 from datetime import datetime
 
 STEAM_ROOT = os.path.expanduser("~/.local/share/Steam")
@@ -154,7 +155,7 @@ def get_installed_games():
     return installed
 
 def parse_appinfo_vdf():
-    """Parse Steam's local binary appinfo.vdf cache for app metadata."""
+    """Parse Steam's local binary appinfo.vdf cache for app metadata (v28/v29 support)."""
     appinfo_path = os.path.join(STEAM_ROOT, "appcache", "appinfo.vdf")
     apps = {}
     if not os.path.isfile(appinfo_path):
@@ -166,25 +167,424 @@ def parse_appinfo_vdf():
     except Exception:
         return apps
 
-    offset = 8
-    raw_len = len(raw)
-    while offset < raw_len - 4:
-        appid = struct.unpack("<I", raw[offset:offset+4])[0]
+    if len(raw) < 16:
+        return apps
+
+    magic, universe = struct.unpack("<II", raw[:8])
+    if magic in (0x07564428, 0x07564429):
+        str_offset = struct.unpack("<Q", raw[8:16])[0]
+        offset = 16
+        app_header_size = 68
+    else:
+        str_offset = len(raw)
+        offset = 8
+        app_header_size = 48
+
+    name_token = b"\x01\x04\x00\x00\x00"
+    type_token = b"\x01\x05\x00\x00\x00"
+    if magic == 0x07564429 and str_offset < len(raw):
+        try:
+            num_strings = struct.unpack("<I", raw[str_offset:str_offset+4])[0]
+            pos = str_offset + 4
+            str_pool = {}
+            for i in range(num_strings):
+                end = raw.find(b"\x00", pos)
+                if end == -1:
+                    break
+                s = raw[pos:end].decode("utf-8", "ignore")
+                str_pool[s] = i
+                pos = end + 1
+            if "name" in str_pool:
+                name_token = b"\x01" + struct.pack("<I", str_pool["name"])
+            if "type" in str_pool:
+                type_token = b"\x01" + struct.pack("<I", str_pool["type"])
+        except Exception:
+            pass
+
+    raw_len = min(len(raw), str_offset)
+    while offset < raw_len - 8:
+        appid, size = struct.unpack("<II", raw[offset:offset+8])
         if appid == 0:
             break
-        size = struct.unpack("<I", raw[offset+4:offset+8])[0]
-        chunk = raw[offset:offset+size+8]
+        chunk = raw[offset+app_header_size : offset+size+8]
         offset += size + 8
 
-        # Extract name using KeyValues token: \x01\x04\x00\x00\x00<name>\x00
-        m_name = re.search(b'\\x01\\x04\\x00\\x00\\x00([^\\x00]+)\\x00', chunk)
+        m_name = re.search(re.escape(name_token) + b"([^\x00]+)\x00", chunk)
+        if not m_name:
+            m_name = re.search(b"\x01name\x00([^\x00]+)\x00", chunk, re.IGNORECASE)
+
         if m_name:
             name = m_name.group(1).decode("utf-8", errors="replace")
-            m_type = re.search(b'\\x01\\x05\\x00\\x00\\x00([^\\x00]+)\\x00', chunk)
+            m_type = re.search(re.escape(type_token) + b"([^\x00]+)\x00", chunk)
+            if not m_type:
+                m_type = re.search(b"\x01type\x00([^\x00]+)\x00", chunk, re.IGNORECASE)
             app_type = m_type.group(1).decode("utf-8", errors="replace") if m_type else "game"
             apps[str(appid)] = {"name": name, "type": app_type}
 
     return apps
+
+def get_non_steam_shortcuts():
+    """Parse shortcuts.vdf across all userdata directories."""
+    shortcuts = {}
+    for p in glob.glob(os.path.join(STEAM_ROOT, "userdata/*/config/shortcuts.vdf")):
+        try:
+            with open(p, "rb") as f:
+                raw = f.read()
+
+            def parse_binary_kv(buf, pos=0):
+                res = {}
+                while pos < len(buf):
+                    t = buf[pos]
+                    pos += 1
+                    if t == 8:
+                        break
+                    key_end = buf.find(b"\x00", pos)
+                    if key_end == -1:
+                        break
+                    key = buf[pos:key_end].decode("utf-8", "ignore")
+                    pos = key_end + 1
+                    if t == 0:
+                        val, pos = parse_binary_kv(buf, pos)
+                        res[key] = val
+                    elif t == 1:
+                        val_end = buf.find(b"\x00", pos)
+                        val = buf[pos:val_end].decode("utf-8", "ignore")
+                        pos = val_end + 1
+                        res[key] = val
+                    elif t == 2:
+                        val = struct.unpack("<I", buf[pos:pos+4])[0]
+                        pos += 4
+                        res[key] = val
+                    else:
+                        break
+                return res, pos
+
+            data, _ = parse_binary_kv(raw)
+            sc_dict = data.get("shortcuts", {})
+            for idx, sc in sc_dict.items():
+                aid = sc.get("appid", 0)
+                name = sc.get("AppName", sc.get("appname", "Shortcut"))
+                exe = sc.get("Exe", sc.get("exe", ""))
+                startdir = sc.get("StartDir", sc.get("startdir", ""))
+                opts = sc.get("LaunchOptions", sc.get("launchoptions", ""))
+                sc_id_64 = (aid << 32) | 0x02000000
+                shortcuts[str(aid)] = {
+                    "name": name,
+                    "appid": str(aid),
+                    "shortcut_id": str(sc_id_64),
+                    "exe": exe,
+                    "startdir": startdir,
+                    "launch_options": opts,
+                }
+        except Exception:
+            pass
+    return shortcuts
+
+def get_game_name(appid):
+    """Retrieve friendly name for Steam app or shortcut."""
+    installed = get_installed_games()
+    if str(appid) in installed:
+        return installed[str(appid)]["name"]
+    shortcuts = get_non_steam_shortcuts()
+    if str(appid) in shortcuts:
+        return shortcuts[str(appid)]["name"]
+    owned = load_owned_cache()
+    if str(appid) in owned:
+        return owned[str(appid)].get("name", f"App {appid}")
+    return f"App {appid}"
+
+def get_cloud_save_status(appid):
+    """Fetch cloud synchronization timestamp and status from remotecache.vdf."""
+    for p in glob.glob(os.path.join(STEAM_ROOT, "userdata/*", str(appid), "remotecache.vdf")):
+        try:
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            m_time = re.search(r'\"(?:remotetime|time)\"\s+\"(\d+)\"', content)
+            m_sync = re.search(r'\"syncstate\"\s+\"(\d+)\"', content)
+            if m_time:
+                ts = int(m_time.group(1))
+                if ts > 100000000:
+                    dt = datetime.fromtimestamp(ts)
+                    state = "Synced" if (m_sync and m_sync.group(1) == "1") else "Local"
+                    return f"{state} ({dt.strftime('%Y-%m-%d %H:%M')})"
+        except Exception:
+            pass
+    return "Local / Not Synced"
+
+def get_compat_tool(appid):
+    """Fetch current Proton or runtime compatibility tool mapping."""
+    cfg_path = os.path.join(STEAM_ROOT, "config", "config.vdf")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            m = re.search(r'\"' + str(appid) + r'\"[\s\n]*\{[^}]*\"name\"\s+\"([^\"]+)\"', content)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    for lib in get_library_folders():
+        if os.path.isdir(os.path.join(lib, "steamapps", "compatdata", str(appid))):
+            return "Proton (Default/Auto)"
+    return "Native Linux"
+
+def get_available_proton_tools():
+    """Discover installed Proton versions and custom compatibility tools."""
+    tools = []
+    for d in glob.glob(os.path.expanduser("~/.local/share/Steam/compatibilitytools.d/*")):
+        if os.path.isdir(d):
+            tools.append((os.path.basename(d), f"Custom: {os.path.basename(d)}"))
+    for d in glob.glob("/usr/share/steam/compatibilitytools.d/*"):
+        if os.path.isdir(d):
+            tools.append((os.path.basename(d), f"System: {os.path.basename(d)}"))
+
+    tools.append(("proton_experimental", "Valve: Proton Experimental"))
+    tools.append(("proton_hotfix", "Valve: Proton Hotfix"))
+
+    for lib in get_library_folders():
+        for p in glob.glob(os.path.join(lib, "steamapps", "common", "Proton*")):
+            b = os.path.basename(p)
+            m_ver = re.search(r'Proton\s+(\d+(?:\.\d+)?)', b)
+            if m_ver:
+                tool_id = f"proton_{m_ver.group(1).replace('.', '_')}"
+                if (tool_id, f"Valve: {b}") not in tools:
+                    tools.append((tool_id, f"Valve: {b}"))
+
+    tools.append(("", "Default (Valve auto-selection or Native)"))
+    return tools
+
+def edit_launch_options(appid):
+    """Interactively view or modify per-game LaunchOptions in localconfig.vdf."""
+    name = get_game_name(appid)
+    lconfs = glob.glob(os.path.join(STEAM_ROOT, "userdata/*/config/localconfig.vdf"))
+    if not lconfs:
+        print(f"\n\033[1;31mError: localconfig.vdf not found in Steam userdata.\033[0m")
+        return
+
+    lconf_path = lconfs[0]
+    with open(lconf_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+
+    cur_opts = ""
+    app_pat = r'(\"' + str(appid) + r'\"\s*\{)([^}]*)'
+    m = re.search(app_pat, content)
+    if m:
+        body = m.group(2)
+        m_opts = re.search(r'\"LaunchOptions\"\s+\"([^\"]*)\"', body)
+        if m_opts:
+            cur_opts = m_opts.group(1)
+
+    print("\n" + "=" * 65)
+    print(f"  ⚙️  Launch Options for \033[1;36m{name}\033[0m (AppID: {appid})")
+    print("=" * 65)
+    if cur_opts:
+        print(f"Current: \033[1;33m{cur_opts}\033[0m\n")
+    else:
+        print("Current: \033[2m[None (using default)]\033[0m\n")
+
+    print("\033[2mExamples:\033[0m")
+    print("  gamemoderun %command%")
+    print("  ENABLE_HDR_WSI=1 gamescope -W 3440 -H 1440 -r 175 --hdr-enabled -- %command%")
+    print("  PROTON_ENABLE_NVAPI=1 %command%\n")
+    print("Type new options below, type \033[1;31mclear\033[0m to remove, or press \033[1mENTER\033[0m to cancel:")
+    try:
+        new_opts = input("❯ ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    if not new_opts:
+        print("No changes made.")
+        import time; time.sleep(0.8)
+        return
+
+    if new_opts.lower() == "clear":
+        new_opts = ""
+
+    if m:
+        body = m.group(2)
+        if re.search(r'\"LaunchOptions\"\s+\"[^\"]*\"', body):
+            new_body = re.sub(r'\"LaunchOptions\"\s+\"[^\"]*\"', f'"LaunchOptions"\t\t"{new_opts}"', body)
+        elif new_opts:
+            new_body = f'\n\t\t\t\t\t\t"LaunchOptions"\t\t"{new_opts}"' + body
+        else:
+            new_body = body
+        new_content = content[:m.start(2)] + new_body + content[m.end(2):]
+    else:
+        apps_idx = content.find('"apps"')
+        if apps_idx != -1:
+            brace_idx = content.find('{', apps_idx)
+            if brace_idx != -1 and new_opts:
+                insert_block = f'\n\t\t\t\t\t"{appid}"\n\t\t\t\t\t{{\n\t\t\t\t\t\t"LaunchOptions"\t\t"{new_opts}"\n\t\t\t\t\t}}'
+                new_content = content[:brace_idx+1] + insert_block + content[brace_idx+1:]
+            else:
+                new_content = content
+        else:
+            new_content = content
+
+    with open(lconf_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    if new_opts:
+        print(f"\n\033[1;32m✔ Updated LaunchOptions to:\033[0m {new_opts}")
+    else:
+        print(f"\n\033[1;32m✔ Cleared LaunchOptions for {name}.\033[0m")
+    import time; time.sleep(1.2)
+
+def set_proton_tool(appid):
+    """Set per-game compatibility tool in config.vdf."""
+    name = get_game_name(appid)
+    cfg_path = os.path.join(STEAM_ROOT, "config", "config.vdf")
+    if not os.path.isfile(cfg_path):
+        print(f"\n\033[1;31mError: config.vdf not found at {cfg_path}\033[0m")
+        return
+
+    tools = get_available_proton_tools()
+    current = get_compat_tool(appid)
+
+    print("\n" + "=" * 65)
+    print(f"  🍷  Select Proton / Compatibility Tool for \033[1;36m{name}\033[0m")
+    print(f"  Current: \033[1;33m{current}\033[0m")
+    print("=" * 65 + "\n")
+
+    for idx, (tid, label) in enumerate(tools):
+        marker = "▶" if tid == current or (not tid and "Default" in current) else " "
+        print(f" {marker} \033[1;33m[{idx}]\033[0m {label} \033[2m({tid or 'default'})\033[0m")
+
+    try:
+        choice = input(f"\nSelect tool [0-{len(tools)-1}] (ENTER to cancel): ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    if not choice.isdigit() or not (0 <= int(choice) < len(tools)):
+        print("Cancelled.")
+        import time; time.sleep(0.8)
+        return
+
+    chosen_id, chosen_label = tools[int(choice)]
+
+    with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+
+    cm_idx = content.find('"CompatToolMapping"')
+    if cm_idx == -1:
+        print("Error: CompatToolMapping section not found in config.vdf")
+        return
+
+    app_pat = r'(\"' + str(appid) + r'\"\s*\{[\s\n]*\"name\"\s+\")([^\"]*)(\")'
+    if re.search(app_pat, content):
+        if chosen_id:
+            new_content = re.sub(app_pat, r'\g<1>' + chosen_id + r'\g<3>', content)
+        else:
+            remove_pat = r'\"' + str(appid) + r'\"\s*\{[^}]*\}\s*'
+            new_content = re.sub(remove_pat, '', content)
+    elif chosen_id:
+        brace_idx = content.find('{', cm_idx)
+        if brace_idx != -1:
+            entry = f'\n\t\t\t\t\t"{appid}"\n\t\t\t\t\t{{\n\t\t\t\t\t\t"name"\t\t"{chosen_id}"\n\t\t\t\t\t\t"config"\t\t""\n\t\t\t\t\t\t"priority"\t\t"250"\n\t\t\t\t\t}}'
+            new_content = content[:brace_idx+1] + entry + content[brace_idx+1:]
+        else:
+            new_content = content
+    else:
+        new_content = content
+
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+
+    print(f"\n\033[1;32m✔ Compatibility tool updated to:\033[0m {chosen_label}")
+    import time; time.sleep(1.2)
+
+def files_menu(appid):
+    """Direct prefix, save-data, and game directory browser / launcher."""
+    name = get_game_name(appid)
+    installed = get_installed_games()
+    app_meta = installed.get(str(appid))
+
+    install_path = app_meta.get("install_path") if app_meta else None
+    pfx_drive_c = None
+    appdata_path = None
+    pfx_dir = None
+
+    for lib in get_library_folders():
+        cpath = os.path.join(lib, "steamapps", "compatdata", str(appid), "pfx")
+        if os.path.isdir(cpath):
+            pfx_dir = cpath
+            dc = os.path.join(cpath, "drive_c")
+            if os.path.isdir(dc):
+                pfx_drive_c = dc
+                ad = os.path.join(dc, "users", "steamuser", "AppData")
+                if os.path.isdir(ad):
+                    appdata_path = ad
+            break
+
+    if not install_path and not pfx_drive_c:
+        print(f"\n\033[1;33mNo local files or Proton prefix found for {name} (AppID: {appid}).\033[0m")
+        try:
+            input("\nPress ENTER to return...")
+        except (KeyboardInterrupt, EOFError):
+            pass
+        return
+
+    print("\n" + "=" * 65)
+    print(f"  📁  Files & Runtime Tools for \033[1;36m{name}\033[0m (AppID: {appid})")
+    print("=" * 65)
+    if install_path and os.path.isdir(install_path):
+        print(f"  Install Dir: \033[2m{install_path}\033[0m")
+    if pfx_drive_c:
+        print(f"  Prefix Dir:  \033[2m{pfx_drive_c}\033[0m")
+    print("-" * 65)
+
+    options = []
+    if install_path and os.path.isdir(install_path):
+        options.append(("term_game", "Open Game Directory in Terminal ($SHELL)"))
+        options.append(("gui_game", "Open Game Directory in File Manager (xdg-open)"))
+    if pfx_drive_c and os.path.isdir(pfx_drive_c):
+        options.append(("term_pfx", "Open Proton Prefix (drive_c) in Terminal"))
+    if appdata_path and os.path.isdir(appdata_path):
+        options.append(("term_appdata", "Open AppData (Saves / Configs) in Terminal"))
+    if pfx_dir:
+        options.append(("winecfg", "Launch winecfg inside Game Prefix"))
+        options.append(("term_wine", "Open Terminal with WINEPREFIX pre-configured"))
+
+    for idx, (action, label) in enumerate(options):
+        print(f"  \033[1;33m[{idx+1}]\033[0m {label}")
+    print(f"  \033[1;37m[0]\033[0m Return to Library")
+
+    try:
+        choice = input(f"\nSelect action [0-{len(options)}]: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        return
+
+    if not choice.isdigit() or choice == "0":
+        return
+
+    c_idx = int(choice) - 1
+    if not (0 <= c_idx < len(options)):
+        return
+
+    act = options[c_idx][0]
+    shell = os.environ.get("SHELL", "/bin/bash")
+
+    if act == "term_game":
+        print(f"\nSpawning shell in {install_path} (type 'exit' to return)...")
+        subprocess.run([shell], cwd=install_path)
+    elif act == "gui_game":
+        subprocess.run(["xdg-open", install_path], stderr=subprocess.DEVNULL)
+    elif act == "term_pfx":
+        print(f"\nSpawning shell in {pfx_drive_c} (type 'exit' to return)...")
+        subprocess.run([shell], cwd=pfx_drive_c)
+    elif act == "term_appdata":
+        print(f"\nSpawning shell in {appdata_path} (type 'exit' to return)...")
+        subprocess.run([shell], cwd=appdata_path)
+    elif act == "winecfg":
+        print(f"\nLaunching winecfg for {name} prefix...")
+        env = dict(os.environ)
+        env["WINEPREFIX"] = pfx_dir
+        subprocess.run(["winecfg"], env=env, stderr=subprocess.DEVNULL)
+    elif act == "term_wine":
+        print(f"\nSpawning shell with WINEPREFIX={pfx_dir} (type 'exit' to return)...")
+        env = dict(os.environ)
+        env["WINEPREFIX"] = pfx_dir
+        subprocess.run([shell], cwd=pfx_drive_c or pfx_dir, env=env)
 
 def load_owned_cache():
     """Load cached owned games from ~/.cache/steam_tui/owned_cache.json."""
@@ -261,15 +661,30 @@ def sync_library():
         except Exception as e:
             sys.stderr.write(f"Web API sync failed, falling back to local scan: {e}\n")
 
-    # 2. Local Discovery: Harvest AppIDs from localconfig.vdf, appcache, and librarycache
+    # 2. Local Discovery: Harvest AppIDs from localconfig.vdf, sharedconfig.vdf, appcache, and librarycache
     candidate_appids = set()
 
     for lconf in glob.glob(os.path.join(STEAM_ROOT, "userdata/*/config/localconfig.vdf")):
         try:
             with open(lconf, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
-            for m in re.finditer(r'\"(\d{2,10})\"\s*\{', text):
-                candidate_appids.add(m.group(1))
+            apps_idx = text.find('"apps"')
+            if apps_idx != -1:
+                apps_slice = text[apps_idx:]
+                for m in re.finditer(r'\"(\d{2,10})\"\s*\{', apps_slice):
+                    candidate_appids.add(m.group(1))
+        except Exception:
+            pass
+
+    for sconf in glob.glob(os.path.join(STEAM_ROOT, "userdata/*/7/remote/sharedconfig.vdf")):
+        try:
+            with open(sconf, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+            apps_idx = text.find('"apps"')
+            if apps_idx != -1:
+                apps_slice = text[apps_idx:]
+                for m in re.finditer(r'\"(\d{2,10})\"\s*\{', apps_slice):
+                    candidate_appids.add(m.group(1))
         except Exception:
             pass
 
@@ -326,19 +741,30 @@ def list_games():
         sf = app.get("state_flags", 4)
         if sf & 1024:
             display_label = f"\033[1;36m[UPDATING]\033[0m    {app['name']}"
-            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATING")
+            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATING\t")
         elif sf & 2:
             display_label = f"\033[1;33m[UPDATE]\033[0m      {app['name']}"
-            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATE_REQUIRED")
+            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATE_REQUIRED\t")
         else:
             display_label = f"\033[1;32m[INSTALLED]\033[0m   {app['name']}"
-            output_lines.append(f"{display_label}\t{app['appid']}\tINSTALLED")
+            output_lines.append(f"{display_label}\t{app['appid']}\tINSTALLED\t")
 
-    # 2. Available (Uninstalled Owned) games
+    # 2. Non-Steam Shortcuts
+    shortcuts = get_non_steam_shortcuts()
+    shortcuts_sorted = sorted(
+        shortcuts.values(),
+        key=lambda x: x["name"].lower()
+    )
+    for sc in shortcuts_sorted:
+        display_label = f"\033[1;35m[SHORTCUT]\033[0m    {sc['name']}"
+        output_lines.append(f"{display_label}\t{sc['appid']}\tSHORTCUT\t{sc['shortcut_id']}")
+
+    # 3. Available (Uninstalled Owned) games
     installed_ids = set(installed.keys())
+    shortcut_ids = set(shortcuts.keys())
     available = []
     for aid, info in owned.items():
-        if aid not in installed_ids:
+        if aid not in installed_ids and aid not in shortcut_ids:
             name = info.get("name", f"App {aid}")
             available.append({"appid": aid, "name": name})
 
@@ -348,7 +774,7 @@ def list_games():
     )
     for app in available_sorted:
         display_label = f"\033[1;34m[AVAILABLE]\033[0m   {app['name']}"
-        output_lines.append(f"{display_label}\t{app['appid']}\tAVAILABLE")
+        output_lines.append(f"{display_label}\t{app['appid']}\tAVAILABLE\t")
 
     return "\n".join(output_lines)
 
@@ -441,9 +867,14 @@ def show_preview(appid, status=None):
     """Display clean Kitty-formatted metadata and pixel-perfect thumbnail."""
     config = load_config()
     installed = get_installed_games()
+    shortcuts = get_non_steam_shortcuts()
     is_installed = str(appid) in installed
+    is_shortcut = str(appid) in shortcuts or status == "SHORTCUT"
+    sc = shortcuts.get(str(appid))
 
-    if is_installed:
+    if is_shortcut:
+        title = sc["name"] if sc else get_game_name(appid)
+    elif is_installed:
         app_meta = installed[str(appid)]
         title = app_meta["name"]
     else:
@@ -453,23 +884,60 @@ def show_preview(appid, status=None):
         else:
             title = f"Steam App {appid}"
 
-    # Render pixel-perfect image preview in Kitty
+    # Artwork resolution & caching
+    chosen_img = None
     if config.get("ENABLE_IMAGE_PREVIEW", "1") == "1":
-        img_candidates = [
-            os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "header.jpg"),
-            os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "library_600x900.jpg"),
-        ]
-        chosen_img = next((img for img in img_candidates if os.path.isfile(img)), None)
+        # 1. Local librarycache glob (handles newer client hash subdirectories)
+        libcache_matches = glob.glob(
+            os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "**", "*header*.jpg"),
+            recursive=True
+        )
+        if not libcache_matches:
+            libcache_matches = glob.glob(
+                os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "**", "*library_600x900*.jpg"),
+                recursive=True
+            )
+
+        # 2. Local custom grid art (shortcuts)
+        grid_matches = []
+        if is_shortcut and sc:
+            sc_id = sc.get("shortcut_id")
+            grid_matches = glob.glob(os.path.join(STEAM_ROOT, "userdata/*/grid", f"{appid}*"))
+            if not grid_matches and sc_id:
+                grid_matches = glob.glob(os.path.join(STEAM_ROOT, "userdata/*/grid", f"{sc_id}*"))
+
+        # 3. Persistent cache directory
+        art_cache_dir = os.path.join(CACHE_DIR, "art")
+        cached_art_path = os.path.join(art_cache_dir, f"{appid}.jpg")
+
+        if libcache_matches:
+            chosen_img = libcache_matches[0]
+        elif grid_matches:
+            chosen_img = grid_matches[0]
+        elif os.path.isfile(cached_art_path):
+            chosen_img = cached_art_path
+        elif not is_shortcut:
+            # 4. Fetch missing header art once from Steam CDN
+            try:
+                os.makedirs(art_cache_dir, exist_ok=True)
+                cdn_url = f"https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{appid}/header.jpg"
+                req = urllib.request.Request(cdn_url, headers={"User-Agent": "steam-tui/1.0"})
+                with urllib.request.urlopen(req, timeout=1.8) as resp:
+                    if resp.status == 200:
+                        with open(cached_art_path, "wb") as f_art:
+                            f_art.write(resp.read())
+                        chosen_img = cached_art_path
+            except Exception:
+                pass
 
         # Clear previous Kitty graphic in preview pane
         sys.stdout.write("\033_Ga=d,d=A\033\\")
         sys.stdout.flush()
 
-        if chosen_img:
+        if chosen_img and os.path.isfile(chosen_img):
             cols = os.environ.get("FZF_PREVIEW_COLUMNS", "44")
             size_arg = config.get("CHAFA_SIZE", f"{cols}x12")
             if shutil.which("chafa"):
-                # Use '-f kitty' instead of '-f symbols' for real pixel graphics!
                 subprocess.run(
                     ["chafa", "-f", "kitty", "--passthrough=none", "--size", size_arg, chosen_img],
                     check=False
@@ -487,11 +955,23 @@ def show_preview(appid, status=None):
                 ], check=False)
                 print("\n" * 12)
 
+    # Metadata Card
     print(f"\033[1;36m╭──────────────────────────────────────────────────╮\033[0m")
-    print(f"\033[1;36m│\033[0m \033[1mTitle:\033[0m   \033[1;37m{title[:38]}\033[0m")
-    print(f"\033[1;36m│\033[0m \033[1mAppID:\033[0m   \033[1;33m{appid}\033[0m")
+    print(f"\033[1;36m│\033[0m \033[1mTitle:\033[0m    \033[1;37m{title[:37]}\033[0m")
+    print(f"\033[1;36m│\033[0m \033[1mAppID:\033[0m    \033[1;33m{appid}\033[0m")
 
-    if is_installed:
+    compat = get_compat_tool(appid)
+    print(f"\033[1;36m│\033[0m \033[1mRuntime:\033[0m  \033[1;35m{compat[:37]}\033[0m")
+
+    if is_shortcut:
+        print(f"\033[1;36m│\033[0m \033[1mStatus:\033[0m   \033[1;35m● Non-Steam Shortcut\033[0m")
+        if sc and sc.get("exe"):
+            print(f"\033[1;36m│\033[0m \033[1mBinary:\033[0m   \033[2m{sc['exe'][:37]}\033[0m")
+        if sc and sc.get("shortcut_id"):
+            print(f"\033[1;36m│\033[0m \033[1mID64:\033[0m     \033[2m{sc['shortcut_id']}\033[0m")
+        print(f"\033[1;36m├──────────────────────────────────────────────────┤\033[0m")
+        print(f"\033[1;36m│\033[0m \033[1;32mAction: Press <ENTER> to launch shortcut\033[0m")
+    elif is_installed:
         app_meta = installed[str(appid)]
         sf = app_meta.get("state_flags", 4)
         if sf & 1024:
@@ -503,15 +983,19 @@ def show_preview(appid, status=None):
             status_line = f"\033[1;33m▲ Update Required ({format_size(b_to)} pending)\033[0m"
         else:
             status_line = f"\033[1;32m● Installed (Ready to play)\033[0m"
-        print(f"\033[1;36m│\033[0m \033[1mStatus:\033[0m  {status_line}")
+        print(f"\033[1;36m│\033[0m \033[1mStatus:\033[0m   {status_line}")
 
         if app_meta.get("size"):
-            print(f"\033[1;36m│\033[0m \033[1mSize:\033[0m    {format_size(app_meta['size'])}")
+            print(f"\033[1;36m│\033[0m \033[1mSize:\033[0m     {format_size(app_meta['size'])}")
         if app_meta.get("last_played"):
             dt = datetime.fromtimestamp(app_meta["last_played"])
-            print(f"\033[1;36m│\033[0m \033[1mPlayed:\033[0m  {dt.strftime('%Y-%m-%d %H:%M')}")
+            print(f"\033[1;36m│\033[0m \033[1mPlayed:\033[0m   {dt.strftime('%Y-%m-%d %H:%M')}")
+
+        cloud = get_cloud_save_status(appid)
+        print(f"\033[1;36m│\033[0m \033[1mCloud:\033[0m    \033[2m{cloud[:37]}\033[0m")
+
         if app_meta.get("library"):
-            print(f"\033[1;36m│\033[0m \033[1mDrive:\033[0m   {app_meta['library']}")
+            print(f"\033[1;36m│\033[0m \033[1mDrive:\033[0m    {app_meta['library']}")
         print(f"\033[1;36m├──────────────────────────────────────────────────┤\033[0m")
         if sf & (2 | 1024):
             print(f"\033[1;36m│\033[0m \033[1;33mAction: Press <ENTER> to track update in terminal\033[0m")
@@ -519,15 +1003,22 @@ def show_preview(appid, status=None):
             print(f"\033[1;36m│\033[0m \033[1;32mAction: Press <ENTER> to launch game\033[0m")
         print(f"\033[1;36m│\033[0m \033[1;31mAction: Press <Ctrl-X> to uninstall game\033[0m")
     else:
-        print(f"\033[1;36m│\033[0m \033[1mStatus:\033[0m  \033[1;34m○ Uninstalled (Available in library)\033[0m")
+        print(f"\033[1;36m│\033[0m \033[1mStatus:\033[0m   \033[1;34m○ Uninstalled (Available in library)\033[0m")
+        cloud = get_cloud_save_status(appid)
+        print(f"\033[1;36m│\033[0m \033[1mCloud:\033[0m    \033[2m{cloud[:37]}\033[0m")
         print(f"\033[1;36m├──────────────────────────────────────────────────┤\033[0m")
         print(f"\033[1;36m│\033[0m \033[1;36mAction: Press <ENTER> to install in terminal\033[0m")
+
+    print(f"\033[1;36m│\033[0m \033[2mHotkeys: <Ctrl-O> Launch Opts │ <Ctrl-P> Proton │ <Ctrl-F> Files\033[0m")
     print(f"\033[1;36m╰──────────────────────────────────────────────────╯\033[0m")
 
-def launch_app(appid):
-    """Launch an installed application silently."""
+def launch_app(appid, shortcut_id=None):
+    """Launch an installed application or non-Steam shortcut silently."""
     start_headless_daemon()
-    cmd = [REAL_STEAM, "-silent", "-applaunch", str(appid)]
+    if shortcut_id:
+        cmd = [REAL_STEAM, "-silent", f"steam://rungameid/{shortcut_id}"]
+    else:
+        cmd = [REAL_STEAM, "-silent", "-applaunch", str(appid)]
     subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -696,13 +1187,36 @@ def get_running_steam_game():
         out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
         clients = json.loads(out)
         installed = get_installed_games()
+        shortcuts = get_non_steam_shortcuts()
+
         for c in clients:
             cls = c.get('class', '')
+            init_cls = c.get('initialClass', '')
+            aid = None
+            name = None
+
             if cls.startswith('steam_app_'):
                 aid = cls.replace('steam_app_', '')
+            elif init_cls.startswith('steam_app_'):
+                aid = init_cls.replace('steam_app_', '')
+
+            if aid:
                 pid = c.get('pid')
-                title = c.get('title')
-                name = installed.get(aid, {}).get('name', title)
+                title = c.get('title', '')
+                name = installed.get(aid, {}).get('name') or shortcuts.get(aid, {}).get('name') or title
+
+                # Collect PID tree (process + direct children + AppId processes)
+                pids_to_check = {str(pid)}
+                try:
+                    c_pids = subprocess.check_output(['pgrep', '-P', str(pid)], stderr=subprocess.DEVNULL).decode('utf-8').strip().split()
+                    pids_to_check.update(c_pids)
+                except Exception:
+                    pass
+                try:
+                    aid_pids = subprocess.check_output(['pgrep', '-f', f'AppId={aid}'], stderr=subprocess.DEVNULL).decode('utf-8').strip().split()
+                    pids_to_check.update(aid_pids)
+                except Exception:
+                    pass
 
                 # Fetch process stats
                 cpu, mem, etime = '0.0', '0.0', '00:00'
@@ -714,14 +1228,24 @@ def get_running_steam_game():
                 except Exception:
                     pass
 
-                # Fetch VRAM if nvidia-smi available
+                # Parse standard nvidia-smi table for G, C, and C+G contexts across all matching PIDs
                 vram = "N/A"
                 try:
-                    smi_out = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'], stderr=subprocess.DEVNULL).decode('utf-8')
-                    for line in smi_out.strip().split('\n'):
-                        if str(pid) in line:
-                            vram_mb = line.split(',')[1].strip()
-                            vram = f"{int(vram_mb) / 1024:.1f} GB"
+                    smi_out = subprocess.check_output(['nvidia-smi'], stderr=subprocess.DEVNULL).decode('utf-8')
+                    total_vram_mib = 0
+                    found_vram = False
+                    for line in smi_out.split('\n'):
+                        m = re.search(r'\|\s+\d+\s+(?:N/A|\d+)\s+(?:N/A|\d+)\s+(\d+)\s+([A-Z\+]+)\s+.*?\s+(\d+)MiB', line)
+                        if m:
+                            p_id, _, mem_val = m.group(1), m.group(2), int(m.group(3))
+                            if p_id in pids_to_check:
+                                total_vram_mib += mem_val
+                                found_vram = True
+                    if found_vram:
+                        if total_vram_mib >= 1024:
+                            vram = f"{total_vram_mib / 1024:.1f} GB"
+                        else:
+                            vram = f"{total_vram_mib} MB"
                 except Exception:
                     pass
 
@@ -796,9 +1320,22 @@ def show_dashboard():
                         sys.stdout.flush()
                         ans = sys.stdin.readline().strip().lower()
                         if ans == 'y':
+                            pid = int(game['pid'])
+                            aid = game.get('appid')
                             try:
-                                subprocess.run(['kill', '-TERM', str(game['pid'])], check=False)
-                                sys.stdout.write(f"\033[1;32mSignal sent to terminate {game['name']}.\033[0m\n")
+                                # Terminate entire process group to avoid zombie wineserver/helpers
+                                try:
+                                    pgid = os.getpgid(pid)
+                                    os.killpg(pgid, signal.SIGTERM)
+                                except Exception:
+                                    os.kill(pid, signal.SIGTERM)
+
+                                # Signal SteamLaunch reaper and Proton wineservers
+                                if aid:
+                                    subprocess.run(["pkill", "-TERM", "-f", f"AppId={aid}"], stderr=subprocess.DEVNULL)
+                                    subprocess.run(["pkill", "-TERM", "-f", f"steam_app_{aid}"], stderr=subprocess.DEVNULL)
+
+                                sys.stdout.write(f"\033[1;32mSignal sent to terminate {game['name']} and child runtimes.\033[0m\n")
                                 sys.stdout.flush()
                             except Exception as e:
                                 sys.stdout.write(f"\033[1;31mError killing process: {e}\033[0m\n")
@@ -810,35 +1347,51 @@ def show_dashboard():
         if old_settings:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
-def launch_and_monitor(appid):
+def launch_and_monitor(appid, shortcut_id=None):
     """Launch game silently, track update/shaders if needed, and monitor session persistently."""
     import time
     cleanup_stale_steam_locks()
-    installed = get_installed_games()
-    app = installed.get(str(appid))
-    name = app["name"] if app else f"App {appid}"
-    manifest_path = app["manifest_path"] if app else None
 
-    # 1. Update check
-    if manifest_path and os.path.isfile(manifest_path):
-        acf = parse_acf_file(manifest_path)
-        if acf and (acf["state_flags"] & 2 or acf["state_flags"] & 1024):
-            print(f"\n\033[1;33mGame update required for {name} ({format_size(acf['bytes_to_download'])})\033[0m")
-            track_update(appid, is_new_install=False)
+    is_shortcut = bool(shortcut_id)
+    if not is_shortcut:
+        shortcuts = get_non_steam_shortcuts()
+        if str(appid) in shortcuts:
+            is_shortcut = True
+            shortcut_id = shortcuts[str(appid)]["shortcut_id"]
 
-    # 2. Ensure minimal Steam daemon is running (CEF disabled)
-    start_headless_daemon()
+    name = get_game_name(appid)
 
-    # 3. Trigger silent launch
-    print(f"\n\033[1;36mInitializing {name} (AppID: {appid})...\033[0m")
-    subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    subprocess.run(["notify-send", "Steam (Headless)", f"Launching {name}...", "-i", "steam"], check=False)
+    if is_shortcut:
+        start_headless_daemon()
+        print(f"\n\033[1;36mInitializing Non-Steam Shortcut {name} (ID: {shortcut_id})...\033[0m")
+        subprocess.Popen([REAL_STEAM, "-silent", f"steam://rungameid/{shortcut_id}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.run(["notify-send", "Steam (Headless)", f"Launching {name}...", "-i", "steam"], check=False)
+    else:
+        installed = get_installed_games()
+        app = installed.get(str(appid))
+        manifest_path = app["manifest_path"] if app else None
 
-    # 4. Wait for game process to appear
+        # 1. Update check
+        if manifest_path and os.path.isfile(manifest_path):
+            acf = parse_acf_file(manifest_path)
+            if acf and (acf["state_flags"] & 2 or acf["state_flags"] & 1024):
+                print(f"\n\033[1;33mGame update required for {name} ({format_size(acf['bytes_to_download'])})\033[0m")
+                track_update(appid, is_new_install=False)
+
+        # 2. Ensure minimal Steam daemon is running (CEF disabled)
+        start_headless_daemon()
+
+        # 3. Trigger silent launch
+        print(f"\n\033[1;36mInitializing {name} (AppID: {appid})...\033[0m")
+        subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.run(["notify-send", "Steam (Headless)", f"Launching {name}...", "-i", "steam"], check=False)
+
+    # 4. Wait for game runtime to attach (dynamic timeout waiting for Proton/fossilize)
     sys.stdout.write("Waiting for game runtime to attach...")
     sys.stdout.flush()
 
-    for _ in range(40):
+    start_wait = time.time()
+    while time.time() - start_wait < 120:
         time.sleep(0.5)
         foz = subprocess.run(["pgrep", "-f", "fossilize_replay"], stdout=subprocess.DEVNULL)
         if foz.returncode == 0:
@@ -846,8 +1399,18 @@ def launch_and_monitor(appid):
             sys.stdout.flush()
 
         game = get_running_steam_game()
-        if game and (game['appid'] == str(appid) or str(appid) in game.get('title', '')):
-            break
+        if game:
+            if game['appid'] == str(appid) or str(appid) in game.get('title', '') or (is_shortcut and (name.lower() in game.get('name', '').lower() or name.lower() in game.get('title', '').lower())):
+                break
+
+        # Check if steam launch helper or wine is still running
+        reaper = subprocess.run(["pgrep", "-f", f"AppId={appid}"], stdout=subprocess.DEVNULL)
+        wine_init = subprocess.run(["pgrep", "-f", "wineserver"], stdout=subprocess.DEVNULL)
+        if reaper.returncode != 0 and wine_init.returncode != 0 and (time.time() - start_wait > 20):
+            if game:
+                break
+            if time.time() - start_wait > 35:
+                break
 
     # 5. Enter persistent dashboard monitor
     show_dashboard()
@@ -918,19 +1481,22 @@ def print_help():
     print("""Usage: steam-tui-backend [OPTION]
 
 Options:
-  --list                    List all installed and owned games (fzf format)
-  --sync                    Synchronize owned games cache from Steam data/API
-  --preview <id> [st]       Show game details and Kitty preview for AppID
-  --launch <id>             Launch installed game silently
-  --install <id>            Headless installation for AppID (EULA bypass)
-  --uninstall <id>          Uninstall game AppID from terminal
-  --track-update <id>       Track update/download in terminal without opening Steam GUI
-  --dashboard               Show interactive session dashboard for running game
-  --has-running             Check if a Steam game is actively running (exit code 0/1)
-  --status                  Print JSON status of running game
-  --launch-and-monitor <id> Launch game and persistently monitor session
-  --open-gui                Open Steam GUI and reclaim RAM on window close
-  --help                    Show this help message
+  --list                            List all installed, shortcut, and owned games (fzf format)
+  --sync                            Synchronize owned games cache from Steam data/API
+  --preview <id> [st]               Show game details, Kitty preview, runtime, & cloud status
+  --launch <id> [shortcut_id]       Launch game or shortcut silently
+  --install <id>                    Headless installation for AppID (EULA bypass)
+  --uninstall <id>                  Uninstall game AppID from terminal
+  --track-update <id>               Track update/download in terminal without opening Steam GUI
+  --dashboard                       Show interactive session dashboard for running game
+  --has-running                     Check if a Steam game is actively running (exit code 0/1)
+  --status                          Print JSON status of running game
+  --launch-and-monitor <id> [sc_id] Launch game and persistently monitor session
+  --edit-launch-options <id>        Configure per-game launch options in localconfig.vdf
+  --set-proton <id>                 Select per-game Proton/GE compatibility tool
+  --files-menu <id>                 Direct prefix, save-data, and winecfg manager
+  --open-gui                        Open Steam GUI and reclaim RAM on window close
+  --help                            Show this help message
 """)
 
 def main():
@@ -957,7 +1523,8 @@ def main():
         if len(sys.argv) < 3:
             sys.stderr.write("Error: --launch requires <appid>\n")
             sys.exit(1)
-        launch_app(sys.argv[2])
+        shortcut_id = sys.argv[3] if len(sys.argv) > 3 else None
+        launch_app(sys.argv[2], shortcut_id)
     elif arg == "--install":
         if len(sys.argv) < 3:
             sys.stderr.write("Error: --install requires <appid>\n")
@@ -986,7 +1553,23 @@ def main():
         if len(sys.argv) < 3:
             sys.stderr.write("Error: --launch-and-monitor requires <appid>\n")
             sys.exit(1)
-        launch_and_monitor(sys.argv[2])
+        shortcut_id = sys.argv[3] if len(sys.argv) > 3 else None
+        launch_and_monitor(sys.argv[2], shortcut_id)
+    elif arg == "--edit-launch-options":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --edit-launch-options requires <appid>\n")
+            sys.exit(1)
+        edit_launch_options(sys.argv[2])
+    elif arg == "--set-proton":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --set-proton requires <appid>\n")
+            sys.exit(1)
+        set_proton_tool(sys.argv[2])
+    elif arg == "--files-menu":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --files-menu requires <appid>\n")
+            sys.exit(1)
+        files_menu(sys.argv[2])
     elif arg == "--open-gui":
         open_steam_gui()
     else:
