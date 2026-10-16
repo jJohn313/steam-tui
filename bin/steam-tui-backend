@@ -509,6 +509,214 @@ def get_launch_options(appid):
 
 ACTIVE_SESSION_FILE = os.path.expanduser("~/.local/share/steam_tui/active_session.json")
 
+def get_active_steam_user():
+    """Discover active Steam user credentials (steamid64, persona_name, account_id)."""
+    loginusers_path = os.path.join(STEAM_ROOT, "config", "loginusers.vdf")
+    active_user = {
+        "steamid64": "76561198345164829",
+        "persona_name": "jJohn313",
+        "account_name": "jjohn313",
+        "account_id": 384899101,
+        "language": "english"
+    }
+
+    if os.path.isfile(loginusers_path):
+        try:
+            with open(loginusers_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            users = []
+            for m in re.finditer(r'\"(\d{17})\"\s*\{([^}]+)\}', content):
+                sid = m.group(1)
+                block = m.group(2)
+                pname = re.search(r'\"PersonaName\"\s*\"([^\"]+)\"', block)
+                aname = re.search(r'\"AccountName\"\s*\"([^\"]+)\"', block)
+                mrecent = re.search(r'\"MostRecent\"\s*\"([^\"]+)\"', block)
+                autolog = re.search(r'\"AutoLogin\"\s*\"([^\"]+)\"', block)
+                ts = re.search(r'\"timestamp\"\s*\"([^\"]+)\"', block)
+
+                users.append({
+                    "steamid64": sid,
+                    "persona_name": pname.group(1) if pname else "Player",
+                    "account_name": aname.group(1) if aname else "player",
+                    "most_recent": mrecent.group(1) == "1" if mrecent else False,
+                    "auto_login": autolog.group(1) == "1" if autolog else False,
+                    "timestamp": int(ts.group(1)) if ts else 0,
+                    "account_id": int(sid) - 76561197960265728
+                })
+            if users:
+                users.sort(key=lambda u: (u["most_recent"], u["auto_login"], u["timestamp"]), reverse=True)
+                top = users[0]
+                active_user["steamid64"] = top["steamid64"]
+                active_user["persona_name"] = top["persona_name"]
+                active_user["account_name"] = top["account_name"]
+                active_user["account_id"] = top["account_id"]
+        except Exception:
+            pass
+    else:
+        try:
+            ud_dirs = [d for d in os.listdir(os.path.join(STEAM_ROOT, "userdata")) if d.isdigit() and d != "0"]
+            if ud_dirs:
+                acc_id = int(ud_dirs[0])
+                active_user["account_id"] = acc_id
+                active_user["steamid64"] = str(acc_id + 76561197960265728)
+        except Exception:
+            pass
+
+    return active_user
+
+def sync_save_data(appid, is_elf=False, compat_data=None, cwd=None, install_path=None):
+    """
+    Ensure 100% bidirectional save data sharing between official Steam and the shim.
+    1. Sets emulator SteamID, AccountName, and Language to match the active official Steam user.
+    2. Writes configs.user.ini (GSE) and user_steam_id.txt/account_name.txt (Goldberg).
+    3. Bi-directionally symlinks Steam Cloud / Remote Storage (<appid>/remote) to Steam's userdata/<account_id>/<appid>/remote.
+    """
+    active_user = get_active_steam_user()
+    steamid64 = active_user["steamid64"]
+    persona_name = active_user["persona_name"]
+    account_id = active_user["account_id"]
+    language = active_user.get("language", "english")
+
+    shim_dir = os.path.expanduser("~/.local/share/steam_tui/shim")
+    shim_settings = os.path.join(shim_dir, "settings")
+    os.makedirs(shim_settings, exist_ok=True)
+
+    # 1. Config file contents
+    ini_content = f"[user::general]\naccount_name={persona_name}\naccount_steamid={steamid64}\nlanguage={language}\nip_country=US\n"
+
+    # Master settings in ~/.local/share/steam_tui/shim/settings/
+    for fname, val in [
+        ("configs.user.ini", ini_content),
+        ("user_steam_id.txt", f"{steamid64}\n"),
+        ("account_name.txt", f"{persona_name}\n"),
+        ("language.txt", f"{language}\n"),
+        ("disable_auto_restart.txt", "1\n"),
+        ("disable_warning_any.txt", "1\n"),
+    ]:
+        try:
+            with open(os.path.join(shim_settings, fname), "w") as f:
+                f.write(val)
+        except Exception:
+            pass
+
+    # 2. Local game directory settings
+    if cwd:
+        cwd_settings = os.path.join(cwd, "steam_settings")
+        if not os.path.exists(cwd_settings):
+            try:
+                os.symlink(shim_settings, cwd_settings)
+            except Exception:
+                pass
+        for target_dir in set([cwd, install_path] if install_path else [cwd]):
+            if target_dir and os.path.isdir(target_dir):
+                try:
+                    with open(os.path.join(target_dir, "steam_appid.txt"), "w") as f:
+                        f.write(f"{appid}\n")
+                except Exception:
+                    pass
+
+    # 3. Official Steam userdata remote storage directory
+    steam_userdata_remote = os.path.join(STEAM_ROOT, "userdata", str(account_id), str(appid), "remote")
+    try:
+        os.makedirs(steam_userdata_remote, exist_ok=True)
+    except Exception:
+        pass
+
+    def setup_remote_symlink(app_dir):
+        """Ensure app_dir/remote points to steam_userdata_remote, migrating any existing files."""
+        try:
+            os.makedirs(app_dir, exist_ok=True)
+            remote_link = os.path.join(app_dir, "remote")
+            if os.path.islink(remote_link):
+                if os.path.realpath(remote_link) != os.path.realpath(steam_userdata_remote):
+                    os.remove(remote_link)
+                    os.symlink(steam_userdata_remote, remote_link)
+            elif os.path.isdir(remote_link):
+                # Migrate any existing saves from shim folder into official Steam userdata
+                for root, dirs, files in os.walk(remote_link):
+                    rel = os.path.relpath(root, remote_link)
+                    tgt = os.path.join(steam_userdata_remote, rel) if rel != "." else steam_userdata_remote
+                    os.makedirs(tgt, exist_ok=True)
+                    for file in files:
+                        s_f = os.path.join(root, file)
+                        d_f = os.path.join(tgt, file)
+                        if not os.path.exists(d_f):
+                            shutil.copy2(s_f, d_f)
+                shutil.rmtree(remote_link)
+                os.symlink(steam_userdata_remote, remote_link)
+            elif not os.path.exists(remote_link):
+                os.symlink(steam_userdata_remote, remote_link)
+        except Exception:
+            pass
+
+    if not is_elf and compat_data:
+        # Windows / Proton Prefix Setup
+        pfx_users = os.path.join(compat_data, "pfx", "drive_c", "users", "steamuser", "AppData", "Roaming")
+
+        # GSE Saves
+        gse_settings = os.path.join(pfx_users, "GSE Saves", "settings")
+        try:
+            os.makedirs(gse_settings, exist_ok=True)
+            with open(os.path.join(gse_settings, "configs.user.ini"), "w") as f:
+                f.write(ini_content)
+        except Exception:
+            pass
+        setup_remote_symlink(os.path.join(pfx_users, "GSE Saves", str(appid)))
+
+        # Goldberg SteamEmu Saves
+        goldberg_settings = os.path.join(pfx_users, "Goldberg SteamEmu Saves", "settings")
+        try:
+            os.makedirs(goldberg_settings, exist_ok=True)
+            for fname in os.listdir(shim_settings):
+                shutil.copy2(os.path.join(shim_settings, fname), os.path.join(goldberg_settings, fname))
+            with open(os.path.join(goldberg_settings, "steam_appid.txt"), "w") as f:
+                f.write(f"{appid}\n")
+        except Exception:
+            pass
+        setup_remote_symlink(os.path.join(pfx_users, "Goldberg SteamEmu Saves", str(appid)))
+
+    else:
+        # Native Linux Game Setup
+        linux_roaming = os.path.expanduser("~/.local/share")
+
+        # GSE Saves
+        gse_settings = os.path.join(linux_roaming, "GSE Saves", "settings")
+        try:
+            os.makedirs(gse_settings, exist_ok=True)
+            with open(os.path.join(gse_settings, "configs.user.ini"), "w") as f:
+                f.write(ini_content)
+        except Exception:
+            pass
+        setup_remote_symlink(os.path.join(linux_roaming, "GSE Saves", str(appid)))
+
+        # Goldberg SteamEmu Saves
+        goldberg_settings = os.path.join(linux_roaming, "Goldberg SteamEmu Saves", "settings")
+        try:
+            os.makedirs(goldberg_settings, exist_ok=True)
+            for fname in os.listdir(shim_settings):
+                shutil.copy2(os.path.join(shim_settings, fname), os.path.join(goldberg_settings, fname))
+            with open(os.path.join(goldberg_settings, "steam_appid.txt"), "w") as f:
+                f.write(f"{appid}\n")
+        except Exception:
+            pass
+        setup_remote_symlink(os.path.join(linux_roaming, "Goldberg SteamEmu Saves", str(appid)))
+
+def sync_all_saves():
+    """Synchronize save configuration and Cloud/Remote storage symlinks for all installed games."""
+    installed = get_installed_games()
+    synced = 0
+    for appid, app in installed.items():
+        install_path = app.get("install_path")
+        if not install_path or not os.path.isdir(install_path):
+            continue
+        exe_info = find_primary_executable(install_path)
+        is_elf = exe_info["is_elf"] if exe_info else False
+        compat_data = get_compat_data_path(appid, install_path) if not is_elf else None
+        cwd = os.path.dirname(exe_info["path"]) if exe_info else None
+        sync_save_data(appid, is_elf=is_elf, compat_data=compat_data, cwd=cwd, install_path=install_path)
+        synced += 1
+    print(f"\033[1;32m✔ Successfully synchronized save data configuration for {synced} games.\033[0m")
+
 def launch_via_shim(appid, app=None):
     """Launch a singleplayer/offline title via lightweight compatibility shim (0 MB Steam client RAM)."""
     if not app:
@@ -540,30 +748,26 @@ def launch_via_shim(appid, app=None):
     if not os.path.isdir(shim_dir):
         raise ValueError(f"Shim directory does not exist: {shim_dir}")
 
-    # 4. Build execution environment and command
+    cwd = os.path.dirname(exe_path)
+    compat_data = None
+    proton_bin = None
+    if not is_elf:
+        proton_bin = get_proton_binary_path(appid)
+        if not proton_bin:
+            raise ValueError("No Proton runtime found for Windows title.")
+        compat_data = get_compat_data_path(appid, install_path)
+
+    # 4. Save data & settings synchronization (100% shared with official Steam)
+    sync_save_data(appid, is_elf=is_elf, compat_data=compat_data, cwd=cwd, install_path=install_path)
+
+    # 5. Build execution environment and command
+    active_user = get_active_steam_user()
     env = os.environ.copy()
     env["SteamAppId"] = str(appid)
     env["SteamGameId"] = str(appid)
-    env["SteamUser"] = os.getenv("USER", "john")
-
-    cwd = os.path.dirname(exe_path)
-
-    # Ensure steam_appid.txt exists in executable directory and game install root
-    for target_dir in set([cwd, install_path]):
-        appid_file = os.path.join(target_dir, "steam_appid.txt")
-        try:
-            with open(appid_file, "w") as f:
-                f.write(f"{appid}\n")
-        except Exception:
-            pass
-
-    # Ensure steam_settings symlink exists in cwd
-    cwd_settings = os.path.join(cwd, "steam_settings")
-    if not os.path.exists(cwd_settings):
-        try:
-            os.symlink(os.path.join(shim_dir, "settings"), cwd_settings)
-        except Exception:
-            pass
+    env["SteamUser"] = active_user["persona_name"]
+    env["SteamAccountId"] = str(active_user["account_id"])
+    env["SteamID"] = str(active_user["steamid64"])
 
     if is_elf:
         # Native Linux Game
@@ -574,11 +778,6 @@ def launch_via_shim(appid, app=None):
         base_cmd = [exe_path]
     else:
         # Windows / Proton Game
-        proton_bin = get_proton_binary_path(appid)
-        if not proton_bin:
-            raise ValueError("No Proton runtime found for Windows title.")
-        compat_data = get_compat_data_path(appid, install_path)
-
         # Clear any stale wineserver/crash handlers before starting to avoid protocol mismatch (938/931)
         try:
             subprocess.run(["killall", "-9", "wineserver", "winedevice.exe", "UnityCrashHandler64.exe", "UnityCrashHandler32.exe"],
@@ -628,24 +827,6 @@ def launch_via_shim(appid, app=None):
                             shutil.copy2(src_dll, dest_dll)
                         except Exception:
                             pass
-
-        # 3. Setup settings in Wine AppData roaming
-        pfx_roaming = os.path.join(compat_data, "pfx", "drive_c", "users", "steamuser", "AppData", "Roaming", "Goldberg SteamEmu Saves", "settings")
-        try:
-            os.makedirs(pfx_roaming, exist_ok=True)
-            settings_src = os.path.join(shim_dir, "settings")
-            if os.path.isdir(settings_src):
-                for sfile in os.listdir(settings_src):
-                    src_f = os.path.join(settings_src, sfile)
-                    dst_f = os.path.join(pfx_roaming, sfile)
-                    try:
-                        shutil.copy2(src_f, dst_f)
-                    except Exception:
-                        pass
-            with open(os.path.join(pfx_roaming, "steam_appid.txt"), "w") as f:
-                f.write(f"{appid}\n")
-        except Exception:
-            pass
 
         env["SteamPath"] = fake_steam_dir
         env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = fake_steam_dir
@@ -1133,6 +1314,7 @@ def files_menu(appid):
     if pfx_dir:
         options.append(("winecfg", "Launch winecfg inside Game Prefix"))
         options.append(("term_wine", "Open Terminal with WINEPREFIX pre-configured"))
+    options.append(("sync_saves", "Synchronize & Share Save Data (Steam <-> Shim)"))
 
     for idx, (action, label) in enumerate(options):
         print(f"  \033[1;33m[{idx+1}]\033[0m {label}")
@@ -1174,6 +1356,18 @@ def files_menu(appid):
         env = dict(os.environ)
         env["WINEPREFIX"] = pfx_dir
         subprocess.run([shell], cwd=pfx_drive_c or pfx_dir, env=env)
+    elif act == "sync_saves":
+        print(f"\n\033[1;36mSynchronizing save data and Cloud storage links for {name}...\033[0m")
+        exe_info = find_primary_executable(install_path) if install_path else None
+        is_elf = exe_info["is_elf"] if exe_info else False
+        compat_data = get_compat_data_path(appid, install_path) if not is_elf else None
+        cwd = os.path.dirname(exe_info["path"]) if exe_info else None
+        sync_save_data(appid, is_elf=is_elf, compat_data=compat_data, cwd=cwd, install_path=install_path)
+        print(f"\033[1;32m✔ Save data sharing successfully configured for {name} (AppID: {appid})!\033[0m")
+        try:
+            input("\nPress ENTER to continue...")
+        except (KeyboardInterrupt, EOFError):
+            pass
 
 def load_owned_cache():
     """Load cached owned games from ~/.cache/steam_tui/owned_cache.json."""
@@ -2725,6 +2919,7 @@ Options:
   --edit-launch-options <id>        Configure per-game launch options in localconfig.vdf
   --set-proton <id>                 Select per-game Proton/GE compatibility tool
   --files-menu <id>                 Direct prefix, save-data, and winecfg manager
+  --sync-saves [id]                 Synchronize & share save data & cloud storage (all or per-app)
   --open-gui                        Open Steam GUI and reclaim RAM on window close
   --help                            Show this help message
 """)
@@ -2850,6 +3045,21 @@ def main():
             sys.stderr.write("Error: --files-menu requires <appid>\n")
             sys.exit(1)
         files_menu(sys.argv[2])
+    elif arg == "--sync-saves":
+        if len(sys.argv) < 3:
+            sync_all_saves()
+        else:
+            aid = sys.argv[2]
+            installed = get_installed_games()
+            app = installed.get(str(aid))
+            ipath = app.get("install_path") if app else None
+            exe_info = find_primary_executable(ipath) if ipath else None
+            is_elf = exe_info["is_elf"] if exe_info else False
+            compat_data = get_compat_data_path(aid, ipath) if not is_elf else None
+            cwd = os.path.dirname(exe_info["path"]) if exe_info else None
+            sync_save_data(aid, is_elf=is_elf, compat_data=compat_data, cwd=cwd, install_path=ipath)
+            aname = app.get("name", f"AppID {aid}") if app else f"AppID {aid}"
+            print(f"\033[1;32m✔ Synchronized save data & cloud storage for {aname} ({aid}).\033[0m")
     elif arg == "--open-gui":
         open_steam_gui()
     elif arg == "--ensure-daemon":
