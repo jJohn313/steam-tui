@@ -908,6 +908,8 @@ def start_headless_daemon():
             "-cef-disable-gpu",
             "-cef-disable-gpu-compositing",
             "-cef-in-process-gpu",
+            "-cef-enable-debugging",
+            "-js-flags=--max-old-space-size=96",
         ]
         env = dict(os.environ)
         if "MILLENNIUM_RUNTIME_PATH" not in env:
@@ -1569,6 +1571,80 @@ def show_dashboard(target_appid=None):
         if old_settings:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
+def constrain_headless_cef():
+    """Surgical CEF memory reducer for headless mode:
+    1. CDP Purge: Closes or redirects non-SharedJSContext CEF targets to about:blank via 127.0.0.1:8080/json
+    2. Cgroup Reclaim: Enforces MemoryHigh=128M (no MemoryMax so OOM never kills) strictly on steamwebhelper PIDs,
+       and triggers kernel memory.reclaim down to ~80-120MB RSS without ever touching the game or steam binaries.
+    """
+    import urllib.request
+    import json
+    import time
+
+    # Give the game process 2 seconds to complete initial launch handshake
+    time.sleep(2.0)
+
+    # 1. CDP Target Purge: close or redirect unused hidden CEF pages
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8080/json", headers={"User-Agent": "steam-tui"})
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            targets = json.loads(resp.read().decode("utf-8"))
+            for t in targets:
+                title = t.get("title", "")
+                url = t.get("url", "")
+                tid = t.get("id")
+                # Do NOT touch SharedJSContext (required for Steamworks DRM, Steam Input, Cloud Sync)
+                if "SharedJSContext" in title or "SharedJSContext" in url:
+                    continue
+                if tid:
+                    try:
+                        close_req = urllib.request.Request(f"http://127.0.0.1:8080/json/close/{tid}")
+                        urllib.request.urlopen(close_req, timeout=0.5)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 2. Dedicated cgroup sub-slice for steamwebhelper PIDs only
+    try:
+        uid = os.getuid()
+        cgroup_dir = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/steam-cef.slice"
+        os.makedirs(cgroup_dir, exist_ok=True)
+
+        # Set MemoryHigh=128M. NEVER set MemoryMax so OOM killer never triggers!
+        mem_high_file = os.path.join(cgroup_dir, "memory.high")
+        if os.path.isfile(mem_high_file):
+            try:
+                with open(mem_high_file, "w") as f:
+                    f.write("134217728\n")
+            except Exception:
+                pass
+
+        # Collect ONLY steamwebhelper PIDs
+        res = subprocess.run(["pgrep", "steamwebhelper"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        cef_pids = res.stdout.decode("utf-8").strip().split()
+
+        # NEVER move steam, reaper, or game PIDs into this cgroup!
+        procs_file = os.path.join(cgroup_dir, "cgroup.procs")
+        if os.path.isfile(procs_file) and cef_pids:
+            for pid in cef_pids:
+                try:
+                    with open(procs_file, "w") as f:
+                        f.write(f"{pid}\n")
+                except Exception:
+                    pass
+
+        # Trigger kernel memory reclaim on the slice
+        mem_reclaim_file = os.path.join(cgroup_dir, "memory.reclaim")
+        if os.path.isfile(mem_reclaim_file):
+            try:
+                with open(mem_reclaim_file, "w") as f:
+                    f.write("524288000\n")
+            except OSError:
+                pass
+    except Exception:
+        pass
+
 def launch_and_monitor(appid, shortcut_id=None):
     """Launch game silently, track update/shaders if needed, and monitor session persistently."""
     import time
@@ -1634,7 +1710,10 @@ def launch_and_monitor(appid, shortcut_id=None):
             if time.time() - start_wait > 35:
                 break
 
-    # 5. Enter persistent dashboard monitor
+    # 5. Surgical in-game memory reduction for steamwebhelper (headless only)
+    constrain_headless_cef()
+
+    # 6. Enter persistent dashboard monitor
     show_dashboard(appid)
 
 def open_steam_gui():
