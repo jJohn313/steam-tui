@@ -1495,6 +1495,13 @@ def safe_post_game_shutdown(appid=None):
 
     print("\r\033[K\033[1;32m✔ Cloud saves synced. Shutting down Steam daemon (0 MB idle)...\033[0m")
     subprocess.run([REAL_STEAM, "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(10):
+        time.sleep(0.5)
+        if subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL).returncode != 0:
+            break
+    else:
+        subprocess.run(["pkill", "-9", "-f", "ubuntu12_32/steam|steamwebhelper"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cleanup_stale_steam_locks()
 
 def auto_shutdown_watcher(appid=None):
     """Detached background worker that monitors a running game and invokes safe_post_game_shutdown when done."""
