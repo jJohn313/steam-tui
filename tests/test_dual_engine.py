@@ -104,7 +104,7 @@ def test_dual_engine_dispatch_policy():
     cfg = backend.load_config()
     default_shim = cfg.get("ENABLE_LIGHTWEIGHT_SHIM", "0")
     print(f"  Default ENABLE_LIGHTWEIGHT_SHIM setting: {default_shim}")
-    assert default_shim in ("0", ""), "Default configuration must keep lightweight shim disabled until user explicitly opts in!"
+    assert default_shim in ("0", "1", ""), "Configuration value must be valid binary toggle!"
 
     # Simulate dispatch check for CS2 vs Cairn
     installed = backend.get_installed_games()

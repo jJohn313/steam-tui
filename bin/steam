@@ -54,7 +54,8 @@ while true; do
     fi
 
     # Run fzf with Kitty-optimized styling and preview pane
-    SELECTED=$(echo "$GAME_LIST" | fzf \
+    RAW_OUT=$(echo "$GAME_LIST" | fzf \
+        --expect=ctrl-s,ctrl-z \
         --delimiter=$'\t' \
         --with-nth=1 \
         --ansi \
@@ -66,7 +67,7 @@ while true; do
         --prompt=" Search ❯ " \
         --pointer="▶" \
         --color="bg+:#1e1e2e,fg+:#cdd6f4,hl:#f38ba8,hl+:#f38ba8,border:#89b4fa,label:#89b4fa,prompt:#cba6f7,pointer:#f5e0dc,header:#6c7086" \
-        --header="ENTER: Launch │ Ctrl-I: Installed │ Ctrl-A: All │ Ctrl-O: Launch Options │ Ctrl-P: Proton │ Ctrl-F: Prefix/Files │ Ctrl-X: Uninstall" \
+        --header="ENTER: Auto Launch │ Ctrl-S: Force Official Steam │ Ctrl-Z: Force 0 MB Shim │ Ctrl-O: Launch Options │ Ctrl-P: Proton │ Ctrl-X: Uninstall" \
         --preview="$BACKEND --preview {2} {3}" \
         --preview-window="right:48%:border-left:wrap" \
         --bind="ctrl-r:reload($BACKEND --sync >/dev/null 2>&1 && $BACKEND --list)" \
@@ -77,6 +78,9 @@ while true; do
         --bind="ctrl-f:execute($BACKEND --files-menu {2})" \
         --bind="ctrl-x:execute($BACKEND --uninstall {2})+reload($BACKEND --list)" \
         --height=92%)
+
+    KEY_PRESSED=$(echo "$RAW_OUT" | head -n 1)
+    SELECTED=$(echo "$RAW_OUT" | tail -n +2)
 
     if [[ -z "$SELECTED" ]]; then
         exit 0
@@ -104,7 +108,14 @@ while true; do
 
     # Persistent Launch & Session Monitor!
     # Handles update progress bar, background shader compilation, and live game session dashboard.
-    "$BACKEND" --launch-and-monitor "$APPID"
+    EXTRA_FLAG=""
+    if [[ "$KEY_PRESSED" == "ctrl-s" ]]; then
+        EXTRA_FLAG="--official"
+    elif [[ "$KEY_PRESSED" == "ctrl-z" ]]; then
+        EXTRA_FLAG="--shim"
+    fi
+
+    "$BACKEND" --launch-and-monitor "$APPID" "" $EXTRA_FLAG
 
     echo ""
     read -r -p "Return to Game Library? [Y/n] " ret

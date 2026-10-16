@@ -375,27 +375,56 @@ def get_proton_binary_path(appid=None):
     if custom_proton and os.path.isfile(custom_proton) and os.access(custom_proton, os.X_OK):
         return custom_proton
 
-    # Check compatibilitytools.d (e.g. GE-Proton)
+    mapped_tool = None
+    if appid:
+        cfg_vdf = os.path.join(STEAM_ROOT, "config", "config.vdf")
+        if os.path.isfile(cfg_vdf):
+            try:
+                with open(cfg_vdf, "r", encoding="utf-8", errors="ignore") as f:
+                    vdf_text = f.read()
+                m = re.search(r'\"' + str(appid) + r'\"\s*\{[^}]*?\"name\"\s*\"([^\"]+)\"', vdf_text, re.DOTALL)
+                if m:
+                    mapped_tool = m.group(1).strip()
+            except Exception:
+                pass
+
     compat_tools_dir = os.path.expanduser("~/.local/share/Steam/compatibilitytools.d")
-    if os.path.isdir(compat_tools_dir):
-        for tool in sorted(os.listdir(compat_tools_dir), reverse=True):
-            p_bin = os.path.join(compat_tools_dir, tool, "proton")
+    libs = get_library_folders()
+
+    # If app is specifically mapped to a custom tool in config.vdf, find it first
+    if mapped_tool:
+        if os.path.isdir(compat_tools_dir):
+            p_bin = os.path.join(compat_tools_dir, mapped_tool, "proton")
+            if os.path.isfile(p_bin) and os.access(p_bin, os.X_OK):
+                return p_bin
+        for lib in libs:
+            p_bin = os.path.join(lib, "steamapps", "common", mapped_tool, "proton")
             if os.path.isfile(p_bin) and os.access(p_bin, os.X_OK):
                 return p_bin
 
-    # Check library folders for Proton
-    for lib in get_library_folders():
+    # Default: Prioritize Valve Proton Experimental in library folders
+    for lib in libs:
+        exp_p = os.path.join(lib, "steamapps", "common", "Proton - Experimental", "proton")
+        if os.path.isfile(exp_p) and os.access(exp_p, os.X_OK):
+            return exp_p
+
+    # Next: Check other official Proton versions in library folders
+    for lib in libs:
         common = os.path.join(lib, "steamapps", "common")
         if not os.path.isdir(common):
             continue
-        exp_p = os.path.join(common, "Proton - Experimental", "proton")
-        if os.path.isfile(exp_p) and os.access(exp_p, os.X_OK):
-            return exp_p
         for d in sorted(os.listdir(common), reverse=True):
             if d.startswith("Proton"):
                 p_bin = os.path.join(common, d, "proton")
                 if os.path.isfile(p_bin) and os.access(p_bin, os.X_OK):
                     return p_bin
+
+    # Fallback to compatibilitytools.d
+    if os.path.isdir(compat_tools_dir):
+        for tool in sorted(os.listdir(compat_tools_dir), reverse=True):
+            p_bin = os.path.join(compat_tools_dir, tool, "proton")
+            if os.path.isfile(p_bin) and os.access(p_bin, os.X_OK):
+                return p_bin
 
     return None
 
@@ -452,7 +481,6 @@ ACTIVE_SESSION_FILE = os.path.expanduser("~/.local/share/steam_tui/active_sessio
 
 def launch_via_shim(appid, app=None):
     """Launch a singleplayer/offline title via lightweight compatibility shim (0 MB Steam client RAM)."""
-    import shlex
     if not app:
         installed = get_installed_games()
         app = installed.get(str(appid))
@@ -503,21 +531,48 @@ def launch_via_shim(appid, app=None):
         if not proton_bin:
             raise ValueError("No Proton runtime found for Windows title.")
         compat_data = get_compat_data_path(appid, install_path)
+
+        # Clear any stale wineserver/crash handlers before starting to avoid protocol mismatch (938/931)
+        try:
+            subprocess.run(["killall", "-9", "wineserver", "UnityCrashHandler64.exe", "UnityCrashHandler32.exe"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        # Auto-inject shim DLLs into prefix system32/syswow64 so LoadLibraryA resolves steamclient64.dll cleanly
+        shim_proton_dir = os.path.join(shim_dir, "proton")
+        pfx_s32 = os.path.join(compat_data, "pfx", "drive_c", "windows", "system32")
+        pfx_swow = os.path.join(compat_data, "pfx", "drive_c", "windows", "syswow64")
+        for target_dir in [pfx_s32, pfx_swow]:
+            if os.path.isdir(target_dir):
+                for dll in ["steamclient64.dll", "steamclient.dll"]:
+                    src_dll = os.path.join(shim_proton_dir, dll)
+                    dest_dll = os.path.join(target_dir, dll)
+                    if os.path.isfile(src_dll) and not os.path.exists(dest_dll):
+                        try:
+                            os.symlink(src_dll, dest_dll)
+                        except Exception:
+                            pass
+
         env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = STEAM_ROOT
         env["STEAM_COMPAT_DATA_PATH"] = compat_data
         env["PROTON_DISABLE_LSTEAMCLIENT"] = "1"
         env["WINEDLLOVERRIDES"] = "steamclient,steamclient64=n,b"
-        env["WINEDLLPATH"] = os.path.join(shim_dir, "proton")
+        env["WINEDLLPATH"] = shim_proton_dir
         base_cmd = [proton_bin, "run", exe_path]
 
     # 5. User Launch Options (e.g. gamescope, gamemoderun, %command%)
     opts = get_launch_options(appid)
     if opts:
-        if "%command%" in opts:
-            cmd_line = opts.replace("%command%", " ".join(shlex.quote(c) for c in base_cmd))
+        clean_opts = opts.rstrip('\\ ')
+        if "%command%" in clean_opts:
+            cmd_line = clean_opts.replace("%command%", " ".join(shlex.quote(c) for c in base_cmd))
             final_cmd = ["/bin/sh", "-c", f"exec {cmd_line}"]
         else:
-            final_cmd = base_cmd + shlex.split(opts)
+            try:
+                final_cmd = base_cmd + shlex.split(clean_opts)
+            except Exception:
+                final_cmd = ["/bin/sh", "-c", f"exec {' '.join(shlex.quote(c) for c in base_cmd)} {clean_opts}"]
     else:
         final_cmd = base_cmd
 
@@ -555,6 +610,13 @@ def launch_via_shim(appid, app=None):
         if os.path.isfile(ACTIVE_SESSION_FILE):
             try:
                 os.remove(ACTIVE_SESSION_FILE)
+            except Exception:
+                pass
+        # If Proton game, kill lingering wineserver & crash handlers to prevent protocol mismatches
+        if not is_elf:
+            try:
+                subprocess.run(["killall", "-9", "wineserver", "UnityCrashHandler64.exe", "UnityCrashHandler32.exe"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
     return True
@@ -2176,6 +2238,9 @@ def constrain_headless_cef(in_game=False):
                     or "steam" in title.lower()
                     or "steamloopback.host" in url.lower()
                 )
+                is_chat_or_popup = any(k in title.lower() or k in url.lower() for k in ["chat", "friends", "notification", "broadcast", "news", "special offers"])
+                if is_chat_or_popup:
+                    is_sp_desktop = False
                 if not in_game and is_sp_desktop:
                     continue
 
@@ -2187,6 +2252,20 @@ def constrain_headless_cef(in_game=False):
                         urllib.request.urlopen(close_req, timeout=0.5)
                     except Exception:
                         pass
+
+        # In Hyprland, close any popup chat/friends/notification windows
+        try:
+            h_out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
+            for c in json.loads(h_out):
+                if c.get('class') == 'steam':
+                    t_low = (c.get('title') or '').lower()
+                    if any(k in t_low for k in ['chat', 'friends', 'news', 'notification', 'special offers']):
+                        addr = c.get('address')
+                        if addr:
+                            subprocess.run(['hyprctl', 'dispatch', 'closewindow', f'address:{addr}'],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -2258,7 +2337,7 @@ def constrain_headless_cef(in_game=False):
         except Exception:
             pass
 
-def launch_and_monitor(appid, shortcut_id=None, force_shim=False):
+def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official=False):
     """Launch game silently, track update/shaders if needed, and monitor session persistently."""
     import time
     cleanup_stale_steam_locks()
@@ -2275,7 +2354,7 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False):
     # Dual-Engine Dispatcher
     cfg = load_config()
     enable_shim = (cfg.get("ENABLE_LIGHTWEIGHT_SHIM") == "1") or force_shim
-    if cfg.get("FORCE_OFFICIAL_STEAM") == "1":
+    if force_official or cfg.get("FORCE_OFFICIAL_STEAM") == "1":
         enable_shim = False
 
     if not is_shortcut and enable_shim:
@@ -2543,12 +2622,15 @@ def main():
             sys.exit(1)
         shortcut_id = None
         force_shim = False
+        force_official = False
         for a in sys.argv[3:]:
             if a == "--shim":
                 force_shim = True
+            elif a == "--official":
+                force_official = True
             elif not shortcut_id:
                 shortcut_id = a
-        launch_and_monitor(sys.argv[2], shortcut_id, force_shim=force_shim)
+        launch_and_monitor(sys.argv[2], shortcut_id, force_shim=force_shim, force_official=force_official)
     elif arg == "--edit-launch-options":
         if len(sys.argv) < 3:
             sys.stderr.write("Error: --edit-launch-options requires <appid>\n")
