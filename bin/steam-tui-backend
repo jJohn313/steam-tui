@@ -514,13 +514,30 @@ def launch_via_shim(appid, app=None):
     env = os.environ.copy()
     env["SteamAppId"] = str(appid)
     env["SteamGameId"] = str(appid)
-    env["SteamPath"] = STEAM_ROOT
     env["SteamUser"] = os.getenv("USER", "john")
 
     cwd = os.path.dirname(exe_path)
 
+    # Ensure steam_appid.txt exists in executable directory and game install root
+    for target_dir in set([cwd, install_path]):
+        appid_file = os.path.join(target_dir, "steam_appid.txt")
+        try:
+            with open(appid_file, "w") as f:
+                f.write(f"{appid}\n")
+        except Exception:
+            pass
+
+    # Ensure steam_settings symlink exists in cwd
+    cwd_settings = os.path.join(cwd, "steam_settings")
+    if not os.path.exists(cwd_settings):
+        try:
+            os.symlink(os.path.join(shim_dir, "settings"), cwd_settings)
+        except Exception:
+            pass
+
     if is_elf:
         # Native Linux Game
+        env["SteamPath"] = STEAM_ROOT
         ld_paths = [os.path.join(shim_dir, "x64"), os.path.join(shim_dir, "x32")]
         curr_ld = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = ":".join(ld_paths + ([curr_ld] if curr_ld else []))
@@ -534,30 +551,77 @@ def launch_via_shim(appid, app=None):
 
         # Clear any stale wineserver/crash handlers before starting to avoid protocol mismatch (938/931)
         try:
-            subprocess.run(["killall", "-9", "wineserver", "UnityCrashHandler64.exe", "UnityCrashHandler32.exe"],
+            subprocess.run(["killall", "-9", "wineserver", "winedevice.exe", "UnityCrashHandler64.exe", "UnityCrashHandler32.exe"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
 
-        # Auto-inject shim DLLs into prefix system32/syswow64 so LoadLibraryA resolves steamclient64.dll cleanly
         shim_proton_dir = os.path.join(shim_dir, "proton")
+
+        # 1. Setup fake_steam directory with legacycompat DLLs so Proton itself copies Goldberg DLLs into prefix
+        fake_steam_dir = os.path.join(shim_dir, "fake_steam")
+        fake_legacy = os.path.join(fake_steam_dir, "legacycompat")
+        os.makedirs(fake_legacy, exist_ok=True)
+        for dll in ["steamclient64.dll", "steamclient.dll"]:
+            src_dll = os.path.join(shim_proton_dir, dll)
+            tgt_dll = os.path.join(fake_legacy, dll)
+            if os.path.isfile(src_dll):
+                if os.path.exists(tgt_dll) or os.path.islink(tgt_dll):
+                    try:
+                        os.remove(tgt_dll)
+                    except Exception:
+                        pass
+                try:
+                    os.symlink(src_dll, tgt_dll)
+                except Exception:
+                    pass
+        steam_dll_stub = os.path.join(fake_legacy, "Steam.dll")
+        if not os.path.exists(steam_dll_stub):
+            try:
+                open(steam_dll_stub, "a").close()
+            except Exception:
+                pass
+
+        # 2. Directly copy Goldberg DLLs into prefix Program Files (x86)/Steam and system32/syswow64
+        pfx_steam = os.path.join(compat_data, "pfx", "drive_c", "Program Files (x86)", "Steam")
         pfx_s32 = os.path.join(compat_data, "pfx", "drive_c", "windows", "system32")
         pfx_swow = os.path.join(compat_data, "pfx", "drive_c", "windows", "syswow64")
-        for target_dir in [pfx_s32, pfx_swow]:
+        for target_dir in [pfx_steam, pfx_s32, pfx_swow]:
             if os.path.isdir(target_dir):
                 for dll in ["steamclient64.dll", "steamclient.dll"]:
                     src_dll = os.path.join(shim_proton_dir, dll)
                     dest_dll = os.path.join(target_dir, dll)
-                    if os.path.isfile(src_dll) and not os.path.exists(dest_dll):
+                    if os.path.isfile(src_dll):
                         try:
-                            os.symlink(src_dll, dest_dll)
+                            if os.path.exists(dest_dll) or os.path.islink(dest_dll):
+                                os.remove(dest_dll)
+                            shutil.copy2(src_dll, dest_dll)
                         except Exception:
                             pass
 
-        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = STEAM_ROOT
+        # 3. Setup settings in Wine AppData roaming
+        pfx_roaming = os.path.join(compat_data, "pfx", "drive_c", "users", "steamuser", "AppData", "Roaming", "Goldberg SteamEmu Saves", "settings")
+        try:
+            os.makedirs(pfx_roaming, exist_ok=True)
+            settings_src = os.path.join(shim_dir, "settings")
+            if os.path.isdir(settings_src):
+                for sfile in os.listdir(settings_src):
+                    src_f = os.path.join(settings_src, sfile)
+                    dst_f = os.path.join(pfx_roaming, sfile)
+                    try:
+                        shutil.copy2(src_f, dst_f)
+                    except Exception:
+                        pass
+            with open(os.path.join(pfx_roaming, "steam_appid.txt"), "w") as f:
+                f.write(f"{appid}\n")
+        except Exception:
+            pass
+
+        env["SteamPath"] = fake_steam_dir
+        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = fake_steam_dir
         env["STEAM_COMPAT_DATA_PATH"] = compat_data
         env["PROTON_DISABLE_LSTEAMCLIENT"] = "1"
-        env["WINEDLLOVERRIDES"] = "steamclient,steamclient64=n,b"
+        env["WINEDLLOVERRIDES"] = "steamclient,steamclient64=n,b;winebrowser.exe=d"
         env["WINEDLLPATH"] = shim_proton_dir
         base_cmd = [proton_bin, "run", exe_path]
 
@@ -612,10 +676,17 @@ def launch_via_shim(appid, app=None):
                 os.remove(ACTIVE_SESSION_FILE)
             except Exception:
                 pass
+        # Kill game process group
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            time.sleep(0.3)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
         # If Proton game, kill lingering wineserver & crash handlers to prevent protocol mismatches
         if not is_elf:
             try:
-                subprocess.run(["killall", "-9", "wineserver", "UnityCrashHandler64.exe", "UnityCrashHandler32.exe"],
+                subprocess.run(["killall", "-9", "wineserver", "winedevice.exe", "UnityCrashHandler64.exe", "UnityCrashHandler32.exe"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
@@ -2648,6 +2719,8 @@ def main():
         files_menu(sys.argv[2])
     elif arg == "--open-gui":
         open_steam_gui()
+    elif arg == "--ensure-daemon":
+        start_headless_daemon()
     else:
         sys.stderr.write(f"Unknown argument: {arg}\n")
         print_help()

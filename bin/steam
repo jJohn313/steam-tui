@@ -26,6 +26,9 @@ fi
 if [[ "$1" == "--gui" || "$1" == "-gui" ]]; then
     exec "$BACKEND" --open-gui
 elif [[ $# -gt 0 ]]; then
+    if ! pgrep -u "$USER" -x "steam" >/dev/null 2>&1; then
+        "$BACKEND" --ensure-daemon >/dev/null 2>&1
+    fi
     exec "$REAL_STEAM" "$@"
 fi
 
