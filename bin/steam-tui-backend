@@ -1440,8 +1440,16 @@ def safe_post_game_shutdown(appid=None):
                 break
 
     # 3. Ensure no background game updates/downloads are actively running before shutting down
+    # Note: StateFlags 1024 is downloading, 512 is paused. An update is only actively downloading if 1024 is set and 512 is NOT set.
     installed = get_installed_games()
-    if any(app.get("state_flags", 4) & 1024 for app in installed.values()):
+    is_actively_downloading = False
+    for app in installed.values():
+        sf = app.get("state_flags", 4)
+        if (sf & 1024) and not (sf & 512):
+            is_actively_downloading = True
+            break
+
+    if is_actively_downloading:
         print("\r\033[K\033[1;33mBackground download active; keeping headless Steam daemon alive.\033[0m")
         return
 
