@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
 
-# Preserve Millennium runtime path if present
-if [[ -f "${HOME}/.local/lib/millennium/libmillennium_x86.so" ]]; then
-    export MILLENNIUM_RUNTIME_PATH="${HOME}/.local/lib/millennium/libmillennium_x86.so"
-fi
-
 REAL_STEAM="/usr/bin/steam"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -x "${SCRIPT_DIR}/steam-tui-backend" ]]; then
@@ -65,7 +60,7 @@ while true; do
         --ansi \
         --layout=reverse \
         --border=rounded \
-        --border-label="  STEAM HEADLESS TUI " \
+        --border-label=" 🎮 STEAM HEADLESS TUI " \
         --border-label-pos=3 \
         --info=inline-right \
         --prompt=" Search ❯ " \

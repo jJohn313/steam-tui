@@ -24,10 +24,50 @@ CONFIG_DIR = os.path.expanduser("~/.config/steam_tui")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.env")
 REAL_STEAM = "/usr/bin/steam"
 
-# Preserve Millennium runtime path if present
-mill_path = os.path.expanduser("~/.local/lib/millennium/libmillennium_x86.so")
-if os.path.isfile(mill_path):
-    os.environ["MILLENNIUM_RUNTIME_PATH"] = mill_path
+def get_steam_env(headless=True):
+    """Dynamically set Steam environment for Vanilla vs Millennium setups."""
+    env = dict(os.environ)
+    mill_path = os.path.expanduser("~/.local/lib/millennium/libmillennium_x86.so")
+    if not os.path.isfile(mill_path):
+        return env
+
+    if not headless:
+        env["MILLENNIUM_RUNTIME_PATH"] = mill_path
+    else:
+        env.pop("MILLENNIUM_RUNTIME_PATH", None)
+        # Preload native 32-bit libXtst.so.6 before Millennium proxy in ubuntu12_32
+        for cand in [
+            "/usr/lib32/libXtst.so.6",
+            os.path.expanduser("~/.local/share/Steam/ubuntu12_32/steam-runtime/usr/lib/i386-linux-gnu/libXtst.so.6"),
+        ]:
+            if os.path.isfile(cand):
+                curr = env.get("LD_PRELOAD", "")
+                env["LD_PRELOAD"] = f"{cand}:{curr}" if curr else cand
+                break
+    return env
+
+def get_steam_pss_mb():
+    """Calculate true unique physical memory (PSS) of Steam and CEF helpers in MB."""
+    total_pss_kb = 0
+    pids = set()
+    for pattern in ["steam", "steamwebhelper"]:
+        try:
+            out = subprocess.check_output(["pgrep", pattern], stderr=subprocess.DEVNULL).decode().split()
+            for p in out:
+                pids.add(p.strip())
+        except Exception:
+            pass
+    pids.discard(str(os.getpid()))
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/smaps_rollup", "r") as f:
+                for line in f:
+                    if line.startswith("Pss:"):
+                        total_pss_kb += int(line.split()[1])
+                        break
+        except Exception:
+            pass
+    return max(0, total_pss_kb // 1024)
 
 FILTER_KEYWORDS = [
     "proton",
@@ -905,19 +945,15 @@ def start_headless_daemon():
             "-silent",
             "-nofriendsui",
             "-nochatui",
+            "-noverifyfiles",
             "-cef-disable-gpu",
             "-cef-disable-gpu-compositing",
             "-cef-in-process-gpu",
+            "-cef-disable-hang-timeouts",
             "-cef-enable-debugging",
-            "-js-flags=--max-old-space-size=96",
+            "-js-flags=--max-old-space-size=64 --lite-mode --optimize-for-size",
         ]
-        env = dict(os.environ)
-        if "MILLENNIUM_RUNTIME_PATH" not in env:
-            mill_path = os.path.expanduser("~/.local/lib/millennium/libmillennium_x86.so")
-            if os.path.isfile(mill_path):
-                env["MILLENNIUM_RUNTIME_PATH"] = mill_path
-
-        subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen(cmd, env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         sys.stdout.write("Waiting for Steam IPC & network connection...")
         sys.stdout.flush()
         ok = wait_for_steam_ready(timeout=25)
@@ -925,6 +961,7 @@ def start_headless_daemon():
             print(" \033[1;32m[Ready]\033[0m")
         else:
             print(" \033[1;33m[Timeout waiting for LoggedOn, proceeding]\033[0m")
+        constrain_headless_cef()
 
 def select_library_folder():
     """Let user pick target drive if multiple Steam libraries exist."""
@@ -1111,6 +1148,7 @@ def launch_app(appid, shortcut_id=None):
         cmd = [REAL_STEAM, "-silent", "-applaunch", str(appid)]
     subprocess.Popen(
         cmd,
+        env=get_steam_env(headless=True),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True
@@ -1156,14 +1194,14 @@ def track_update(appid, is_new_install=False):
                 pass
 
         # Trigger download in Steam via steam://install/<appid> and -applaunch
-        subprocess.Popen([REAL_STEAM, "-silent", f"steam://install/{appid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen([REAL_STEAM, "-silent", f"steam://install/{appid}"], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         time.sleep(1)
-        subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     else:
         print(f"\n\033[1;36mDispatching headless update for {name}...\033[0m")
-        subprocess.Popen([REAL_STEAM, "-silent", f"steam://install/{appid}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen([REAL_STEAM, "-silent", f"steam://install/{appid}"], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         time.sleep(1)
-        subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
     # 3. Wait up to 15 seconds for Steam to allocate/recognize appmanifest_<appid>.acf
     manifest_path = find_manifest_across_libraries(appid)
@@ -1177,7 +1215,7 @@ def track_update(appid, is_new_install=False):
                 break
         if not manifest_path:
             # Fallback trigger
-            subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for _ in range(20):
                 time.sleep(0.5)
                 manifest_path = find_manifest_across_libraries(appid)
@@ -1505,15 +1543,19 @@ def show_dashboard(target_appid=None):
                 safe_post_game_shutdown(target_appid)
                 return 0
 
+            pss_mb = get_steam_pss_mb()
+            daemon_info = f"Headless Mode (Steam PSS: {pss_mb} MB | Auto-Reclaim Active)"
+            pad_daemon = max(0, 59 - len(daemon_info))
+
             lines = [
                 "\033[H\033[J",
                 "\033[1;36m╭──────────────────────────────────────────────────────────────────────────╮\033[0m",
-                "\033[1;36m│\033[0m  \033[1;35m STEAM HEADLESS CLI\033[0m \033[2m│\033[0m \033[1;32m● Active Game Session\033[0m                            \033[1;36m│\033[0m",
+                "\033[1;36m│\033[0m  \033[1;35m🎮 STEAM HEADLESS CLI\033[0m \033[2m│\033[0m \033[1;32m● Active Game Session\033[0m                           \033[1;36m│\033[0m",
                 "\033[1;36m├──────────────────────────────────────────────────────────────────────────┤\033[0m",
                 f"\033[1;36m│\033[0m  \033[1mGame:\033[0m        \033[1;37m{game['name'][:42]:<42}\033[0m \033[2m(AppID: {game['appid']:<8})\033[0m \033[1;36m│\033[0m",
                 f"\033[1;36m│\033[0m  \033[1mProcess:\033[0m     PID \033[1;33m{str(game['pid']):<8}\033[0m \033[2m│\033[0m Workspace: \033[1;34m{str(game['workspace']):<32}\033[0m \033[1;36m│\033[0m",
                 f"\033[1;36m│\033[0m  \033[1mTelemetry:\033[0m   Time: \033[1;32m{game['etime']:<7}\033[0m \033[2m│\033[0m CPU: \033[1;33m{game['cpu']:>4}%\033[0m \033[2m│\033[0m RAM: \033[1;33m{game['mem']:>4}%\033[0m \033[2m│\033[0m VRAM: \033[1;33m{game['vram']:<8}\033[0m \033[1;36m│\033[0m",
-                f"\033[1;36m│\033[0m  \033[1mDaemon:\033[0m      \033[1;32mHeadless Mode\033[0m \033[2m(Low-RAM CEF / GPU Disabled / Auto-Reclaim)\033[0m \033[1;36m│\033[0m",
+                f"\033[1;36m│\033[0m  \033[1mDaemon:\033[0m      \033[1;32mHeadless Mode\033[0m \033[2m(Steam PSS: {pss_mb} MB | Auto-Reclaim Active)\033[0m{' ' * pad_daemon}\033[1;36m│\033[0m",
                 "\033[1;36m├──────────────────────────────────────────────────────────────────────────┤\033[0m",
                 "\033[1;36m│\033[0m  \033[1;33m[b]\033[0m Browse Library     \033[1;31m[k]\033[0m Terminate Game     \033[1;37m[q / Esc]\033[0m Detach & Exit   \033[1;36m│\033[0m",
                 "\033[1;36m╰──────────────────────────────────────────────────────────────────────────╯\033[0m",
@@ -1573,18 +1615,55 @@ def show_dashboard(target_appid=None):
 
 def constrain_headless_cef():
     """Surgical CEF memory reducer for headless mode:
-    1. CDP Purge: Closes or redirects non-SharedJSContext CEF targets to about:blank via 127.0.0.1:8080/json
-    2. Cgroup Reclaim: Enforces MemoryHigh=128M (no MemoryMax so OOM never kills) strictly on steamwebhelper PIDs,
-       and triggers kernel memory.reclaim down to ~80-120MB RSS without ever touching the game or steam binaries.
+    1. Dedicated cgroup sub-slice for steamwebhelper PIDs only (MemoryHigh=128M, no MemoryMax).
+    2. Moves all steamwebhelper PIDs (master root, zygotes, utilities) into steam-cef.slice.
+    3. Immediately recycles bloated non-SharedJSContext child renderers via CDP (127.0.0.1:8080/json).
+    4. Finds any --type=utility processes and triggers kernel memory.reclaim twice with 0.5s delay.
     """
     import urllib.request
     import json
     import time
 
-    # Give the game process 2 seconds to complete initial launch handshake
-    time.sleep(2.0)
+    uid = os.getuid()
+    cgroup_dir = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/steam-cef.slice"
+    try:
+        os.makedirs(cgroup_dir, exist_ok=True)
+    except Exception:
+        pass
 
-    # 1. CDP Target Purge: close or redirect unused hidden CEF pages
+    # 1. Set MemoryHigh=128M. NEVER set MemoryMax so OOM killer never triggers!
+    mem_high_file = os.path.join(cgroup_dir, "memory.high")
+    if os.path.isfile(mem_high_file):
+        try:
+            with open(mem_high_file, "w") as f:
+                f.write("134217728\n")
+        except Exception:
+            pass
+
+    swap_max_file = os.path.join(cgroup_dir, "memory.swap.max")
+    if os.path.isfile(swap_max_file):
+        try:
+            with open(swap_max_file, "w") as f:
+                f.write("max\n")
+        except Exception:
+            pass
+
+    # 2. Move all steamwebhelper PIDs (including master root and zygotes) into steam-cef.slice
+    procs_file = os.path.join(cgroup_dir, "cgroup.procs")
+    if os.path.isfile(procs_file):
+        try:
+            res = subprocess.run(["pgrep", "steamwebhelper"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            cef_pids = res.stdout.decode("utf-8").strip().split()
+            for pid in cef_pids:
+                try:
+                    with open(procs_file, "w") as f:
+                        f.write(f"{pid}\n")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 3. Immediately recycle bloated non-SharedJSContext child renderers via CDP
     try:
         req = urllib.request.Request("http://127.0.0.1:8080/json", headers={"User-Agent": "steam-tui"})
         with urllib.request.urlopen(req, timeout=1.0) as resp:
@@ -1605,45 +1684,32 @@ def constrain_headless_cef():
     except Exception:
         pass
 
-    # 2. Dedicated cgroup sub-slice for steamwebhelper PIDs only
-    try:
-        uid = os.getuid()
-        cgroup_dir = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/steam-cef.slice"
-        os.makedirs(cgroup_dir, exist_ok=True)
-
-        # Set MemoryHigh=128M. NEVER set MemoryMax so OOM killer never triggers!
-        mem_high_file = os.path.join(cgroup_dir, "memory.high")
-        if os.path.isfile(mem_high_file):
-            try:
-                with open(mem_high_file, "w") as f:
-                    f.write("134217728\n")
-            except Exception:
-                pass
-
-        # Collect ONLY steamwebhelper PIDs
-        res = subprocess.run(["pgrep", "steamwebhelper"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        cef_pids = res.stdout.decode("utf-8").strip().split()
-
-        # NEVER move steam, reaper, or game PIDs into this cgroup!
-        procs_file = os.path.join(cgroup_dir, "cgroup.procs")
-        if os.path.isfile(procs_file) and cef_pids:
-            for pid in cef_pids:
+    # 4. Find any steamwebhelper child process with --type=utility and ensure it is moved
+    if os.path.isfile(procs_file):
+        try:
+            for pid_dir in glob.glob("/proc/[0-9]*"):
+                pid = os.path.basename(pid_dir)
                 try:
-                    with open(procs_file, "w") as f:
-                        f.write(f"{pid}\n")
+                    with open(f"{pid_dir}/cmdline", "rb") as f_cmd:
+                        cmdline = f_cmd.read().decode("utf-8", errors="ignore")
+                        if "--type=utility" in cmdline and ("steamwebhelper" in cmdline or "exe" in cmdline):
+                            with open(procs_file, "w") as f:
+                                f.write(f"{pid}\n")
                 except Exception:
                     pass
+        except Exception:
+            pass
 
-        # Trigger kernel memory reclaim on the slice
-        mem_reclaim_file = os.path.join(cgroup_dir, "memory.reclaim")
-        if os.path.isfile(mem_reclaim_file):
+    # Write 524288000 to memory.reclaim twice with 0.5s delay
+    mem_reclaim_file = os.path.join(cgroup_dir, "memory.reclaim")
+    if os.path.isfile(mem_reclaim_file):
+        for _ in range(2):
             try:
                 with open(mem_reclaim_file, "w") as f:
                     f.write("524288000\n")
             except OSError:
                 pass
-    except Exception:
-        pass
+            time.sleep(0.5)
 
 def launch_and_monitor(appid, shortcut_id=None):
     """Launch game silently, track update/shaders if needed, and monitor session persistently."""
@@ -1662,7 +1728,7 @@ def launch_and_monitor(appid, shortcut_id=None):
     if is_shortcut:
         start_headless_daemon()
         print(f"\n\033[1;36mInitializing Non-Steam Shortcut {name} (ID: {shortcut_id})...\033[0m")
-        subprocess.Popen([REAL_STEAM, "-silent", f"steam://rungameid/{shortcut_id}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen([REAL_STEAM, "-silent", f"steam://rungameid/{shortcut_id}"], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         subprocess.run(["notify-send", "Steam (Headless)", f"Launching {name}...", "-i", "steam"], check=False)
     else:
         installed = get_installed_games()
@@ -1681,7 +1747,7 @@ def launch_and_monitor(appid, shortcut_id=None):
 
         # 3. Trigger silent launch
         print(f"\n\033[1;36mInitializing {name} (AppID: {appid})...\033[0m")
-        subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         subprocess.run(["notify-send", "Steam (Headless)", f"Launching {name}...", "-i", "steam"], check=False)
 
     # 4. Wait for game runtime to attach (dynamic timeout waiting for Proton/fossilize)
@@ -1721,7 +1787,27 @@ def open_steam_gui():
     import time
     cleanup_stale_steam_locks()
 
-    # If Steam is already running, launching REAL_STEAM unhides/opens the main client window via IPC
+    # 1. Uncap memory limit on steam-cef.slice so GUI is never throttled
+    uid = os.getuid()
+    cgroup_high = f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/steam-cef.slice/memory.high"
+    if os.path.isfile(cgroup_high):
+        try:
+            with open(cgroup_high, "w") as f:
+                f.write("max\n")
+        except Exception:
+            pass
+
+    # 2. If no game is running and headless Steam is active, restart Steam to enable full GPU & Millennium
+    if not get_running_steam_game():
+        res = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL)
+        if res.returncode == 0:
+            print("Restarting Steam in full GUI mode with GPU acceleration & Millennium...")
+            subprocess.run([REAL_STEAM, "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(10):
+                time.sleep(0.5)
+                if subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL).returncode != 0:
+                    break
+            cleanup_stale_steam_locks()
 
     # Get active workspace id
     ws_id = "1"
@@ -1733,7 +1819,7 @@ def open_steam_gui():
 
     print("Launching Steam GUI (Store/Community mode)...")
     cleanup_stale_steam_locks()
-    subprocess.Popen([REAL_STEAM], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    subprocess.Popen([REAL_STEAM], env=get_steam_env(headless=False), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
     # Wait for window to appear
     steam_addr = None
