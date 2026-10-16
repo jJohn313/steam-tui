@@ -8,6 +8,10 @@ Intercepts interactive terminal calls to `steam` to deliver an instantaneous, ke
 
 ## ⚡ Highlights
 
+- **Dual-Engine Architecture (Zero-Overhead Shim vs. Headless Steam)**: Automatically evaluates game requirements to select the optimal engine. Singleplayer and offline games run directly through an emulated compatibility shim with **0 MB Steam client RAM overhead**, while titles requiring online anti-cheat or official Valve DRM route safely through the headless client.
+- **Intelligent Anti-Cheat Classifier & Safety Fallback**: Proactively inspects game binaries (`magic`, `machine_type`, `.bind` section signatures) to detect VAC, Easy Anti-Cheat (EAC), BattlEye, Denuvo, Ricochet, Vanguard, and Valve SteamStub DRM. Guaranteed zero bans or launch crashes by automatically promoting protected titles to the official Steam runtime.
+- **100% Bidirectional Save Data & Cloud Storage Synchronization**: Dynamically detects your active Steam credentials (`SteamID64`, persona name, 32-bit `AccountID`) from `loginusers.vdf` and synchronizes user profiles into Proton prefixes and native directories. Automatically symlinks `<appid>/remote` directly to Valve's official `userdata/<account_id>/<appid>/remote/`, guaranteeing that save files (including SteamID-partitioned saves like *NieR Replicant* or Capcom games) and Steam Cloud saves are shared transparently across both modes.
+- **In-Flight Update Tracking & Automatic Game Launch**: Intercepts active game downloads and updates at launch time, rendering live progress bars, download speeds, and ETAs in the terminal without opening the GUI, and automatically launches the game the moment the update completes.
 - **Low-RAM Headless Daemon Diet**: Starts Steam silently with `-silent`, `-nofriendsui`, `-nochatui`, `-cef-disable-gpu`, `-cef-disable-gpu-compositing`, `-cef-in-process-gpu`, `-cef-enable-debugging`, and `-js-flags=--max-old-space-size=96` to collapse helper processes and cap V8 heap growth while keeping `SharedJSContext` responsive for Steam Input, overlay, achievements, and cloud sync.
 - **Surgical In-Game CEF Memory Reducer**: Once a game attaches, `constrain_headless_cef()` isolates `steamwebhelper` PIDs into a dedicated background cgroup slice (`steam-cef.slice`) with `MemoryHigh=128M` (with NO `MemoryMax` so OOM never kills) and triggers kernel `memory.reclaim`, while purging non-SharedJSContext hidden CEF tabs via local CDP. This drives idle Chromium physical memory down to ~80–120 MB without trapping the game process or breaking Steam Input.
 - **Deterministic Post-Game RAM Reclamation (0 MB Idle)**: When a game exits, the backend waits for the Proton `reaper` container and `wineserver` to exit cleanly, confirms Steam Cloud sync completion via `cloud_log.txt`, verifies no background updates are active, and automatically runs `steam -shutdown`.
@@ -93,12 +97,14 @@ steam -silent -applaunch 730
 
 | Keybinding | Action |
 | :--- | :--- |
-| `<ENTER>` | **Installed Game**: Launches game and opens live session tracker.<br>**Shortcut**: Launches non-Steam shortcut via Proton.<br>**Available Game**: Triggers terminal install with drive selector and EULA bypass. |
+| `<ENTER>` | **Auto Launch**: Automatically selects optimal engine (0 MB Shim for singleplayer/offline vs Headless Steam for anti-cheat/DRM), tracks in-flight updates, and launches game.<br>**Shortcut**: Launches non-Steam shortcut via Proton.<br>**Available Game**: Triggers terminal install with drive selector and EULA bypass. |
+| `<Ctrl+S>` | **Force Official Steam**: Launches selected game using headless official Steam client (bypasses 0 MB shim). |
+| `<Ctrl+Z>` | **Force 0 MB Shim**: Launches selected game using lightweight compatibility shim (zero Steam client overhead). |
 | `<Ctrl+I>` | Filters view to display **Installed, Updating, & Shortcut games only**. |
 | `<Ctrl+A>` | Resets filter to show **All games** (installed + uninstalled + shortcuts). |
 | `<Ctrl+O>` | Opens inline editor for per-game **Launch Options** (`localconfig.vdf`). |
 | `<Ctrl+P>` | Selects Proton / GE-Proton **Compatibility Tool** (`config.vdf`). |
-| `<Ctrl+F>` | Opens **Prefix & Files Menu** (game dir, prefix `drive_c`, `AppData`, `winecfg`). |
+| `<Ctrl+F>` | Opens **Prefix & Files Menu** (game dir, prefix `drive_c`, `AppData`, `winecfg`, and **Save Data Sync**). |
 | `<Ctrl+X>` | Prompts to **Uninstall selected game** directly from terminal. |
 | `<Ctrl+R>` | Rescans library drives, parses manifests, refreshes cache, and live-reloads list. |
 | `<ESC>` / `<Ctrl+C>` | Exits launcher without starting Steam. |
@@ -128,8 +134,19 @@ steam-tui-backend --sync
 # Render preview card for specific AppID
 steam-tui-backend --preview 1091500 INSTALLED
 
-# Launch and attach persistent monitor to AppID or Shortcut ID
+# Launch and attach persistent monitor to AppID (automatic dual-engine dispatch)
 steam-tui-backend --launch-and-monitor 1091500
+
+# Force launch with specific engine (--shim for 0 MB client, --official for Valve client)
+steam-tui-backend --launch-and-monitor 1091500 --shim
+steam-tui-backend --launch-and-monitor 1091500 --official
+
+# Inspect anti-cheat & DRM compatibility classification
+steam-tui-backend --inspect-anticheat 1091500
+
+# Synchronize & share save data & cloud storage symlinks across all games (or specify AppID)
+steam-tui-backend --sync-saves
+steam-tui-backend --sync-saves 1091500
 
 # Open interactive launch options editor
 steam-tui-backend --edit-launch-options 1091500
@@ -137,7 +154,7 @@ steam-tui-backend --edit-launch-options 1091500
 # Open interactive Proton compatibility tool selector
 steam-tui-backend --set-proton 1091500
 
-# Open prefix and files navigation menu
+# Open prefix and files navigation menu (with save sync)
 steam-tui-backend --files-menu 1091500
 
 # Open live dashboard for already-running game
@@ -164,6 +181,15 @@ ENABLE_IMAGE_PREVIEW=1
 
 # Image preview size for chafa (Width x Height)
 CHAFA_SIZE=42x11
+
+# Dual-Engine Architecture Settings
+# 1 = Use 0 MB lightweight compatibility shim for singleplayer/offline games
+# 0 = Always route through headless official Steam client
+ENABLE_LIGHTWEIGHT_SHIM=1
+
+# 1 = Force official Steam client globally for all launches
+# 0 = Allow intelligent anti-cheat classifier to choose the optimal engine
+FORCE_OFFICIAL_STEAM=0
 
 # Optional: Provide Steam Web API Key & SteamID64 for cloud library synchronization
 # STEAM_API_KEY=""
