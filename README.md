@@ -8,7 +8,9 @@ Intercepts interactive terminal calls to `steam` to deliver an instantaneous, ke
 
 ## ⚡ Highlights
 
-- **Minimal Daemon Footprint**: Starts Steam silently with `-silent`, `-nofriendsui`, and `-nochatui` to suppress window mapping and chat CEF overhead while maintaining Steamworks DRM, cloud saves, and socket support.
+- **Low-RAM Headless Daemon Diet**: Starts Steam silently with `-silent`, `-nofriendsui`, `-nochatui`, `-cef-disable-gpu`, `-cef-disable-gpu-compositing`, and `-cef-in-process-gpu` to collapse helper processes and eliminate GPU compositor buffers while keeping `SharedJSContext` responsive for Steam Input, overlay, achievements, and cloud sync.
+- **Deterministic Post-Game RAM Reclamation (0 MB Idle)**: When a game exits, the backend waits for the Proton `reaper` container and `wineserver` to exit cleanly, confirms Steam Cloud sync completion via `cloud_log.txt`, verifies no background updates are active, and automatically runs `steam -shutdown`.
+- **Detached Background Auto-Shutdown**: Pressing `q` or `Esc` in the HUD detaches the terminal while spawning a background watcher (`--auto-shutdown <appid>`) that automatically performs the safe cloud sync flush and shutdown when the game closes.
 - **Automatic GUI RAM Reclamation**: Running `steam --gui` launches the full Store/Community client, monitors the Hyprland window lifecycle, and automatically shuts down CEF processes when the window is closed to immediately recover 1GB+ of system memory.
 - **Headless Terminal Installation & EULA Bypass**: Installs games directly from terminal via bootstrap ACF manifests and `steam://install/<appid>`, bypassing GUI prompts, multi-step install modals, and EULA blocks.
 - **Interactive Multi-Drive Target Selector**: Prompts for target library destination when installing across multiple mounted drives with free disk space statistics.

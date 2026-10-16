@@ -905,6 +905,9 @@ def start_headless_daemon():
             "-silent",
             "-nofriendsui",
             "-nochatui",
+            "-cef-disable-gpu",
+            "-cef-disable-gpu-compositing",
+            "-cef-in-process-gpu",
         ]
         env = dict(os.environ)
         if "MILLENNIUM_RUNTIME_PATH" not in env:
@@ -1408,7 +1411,61 @@ def get_running_steam_game():
 
     return None
 
-def show_dashboard():
+def safe_post_game_shutdown(appid=None):
+    """Wait for Proton prefix teardown and Cloud Sync completion before shutting down Steam."""
+    import time
+    sys.stdout.write("\033[1;34mWaiting for Proton prefix & Steam Cloud sync to finish...\033[0m")
+    sys.stdout.flush()
+
+    # 1. Wait until the SteamLaunch reaper container for this AppID has fully exited
+    if appid:
+        for _ in range(60):  # Up to 30s for slow wineserver teardown
+            res = subprocess.run(["pgrep", "-f", f"AppId={appid}"], stdout=subprocess.DEVNULL)
+            if res.returncode != 0:
+                break
+            time.sleep(0.5)
+
+    # 2. Wait for Steam Cloud activity in cloud_log.txt to settle
+    cloud_log = os.path.join(STEAM_ROOT, "logs", "cloud_log.txt")
+    time.sleep(2.0)  # Initial window for Cloud Sync job to register after reaper exit
+    if os.path.isfile(cloud_log):
+        for _ in range(30):
+            # If cloud_log.txt was modified in the last 2.5 seconds, sync is still active
+            try:
+                if time.time() - os.path.getmtime(cloud_log) < 2.5:
+                    time.sleep(1.0)
+                else:
+                    break
+            except Exception:
+                break
+
+    # 3. Ensure no background game updates/downloads are actively running before shutting down
+    installed = get_installed_games()
+    if any(app.get("state_flags", 4) & 1024 for app in installed.values()):
+        print("\r\033[K\033[1;33mBackground download active; keeping headless Steam daemon alive.\033[0m")
+        return
+
+    print("\r\033[K\033[1;32m✔ Cloud saves synced. Shutting down Steam daemon (0 MB idle)...\033[0m")
+    subprocess.run([REAL_STEAM, "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def auto_shutdown_watcher(appid=None):
+    """Detached background worker that monitors a running game and invokes safe_post_game_shutdown when done."""
+    import time
+    while True:
+        game = get_running_steam_game()
+        if game and (str(game.get('appid')) == str(appid) or (appid and str(appid) in str(game.get('title', '')))):
+            time.sleep(1.0)
+            continue
+        if appid:
+            reaper = subprocess.run(["pgrep", "-f", f"AppId={appid}"], stdout=subprocess.DEVNULL)
+            if reaper.returncode == 0:
+                time.sleep(1.0)
+                continue
+        # Game has exited
+        break
+    safe_post_game_shutdown(appid)
+
+def show_dashboard(target_appid=None):
     """Persistent dashboard for actively running Steam game session."""
     import select
     import termios
@@ -1418,6 +1475,9 @@ def show_dashboard():
     if not game:
         print("No active Steam game is currently running.")
         return 1
+
+    if not target_appid:
+        target_appid = game.get('appid')
 
     old_settings = None
     if sys.stdin.isatty():
@@ -1432,6 +1492,7 @@ def show_dashboard():
             if not game:
                 sys.stdout.write("\r\033[K\n\033[1;32m✔ Active game session has finished.\033[0m\n\n")
                 sys.stdout.flush()
+                safe_post_game_shutdown(target_appid)
                 return 0
 
             lines = [
@@ -1442,7 +1503,7 @@ def show_dashboard():
                 f"\033[1;36m│\033[0m  \033[1mGame:\033[0m        \033[1;37m{game['name'][:42]:<42}\033[0m \033[2m(AppID: {game['appid']:<8})\033[0m \033[1;36m│\033[0m",
                 f"\033[1;36m│\033[0m  \033[1mProcess:\033[0m     PID \033[1;33m{str(game['pid']):<8}\033[0m \033[2m│\033[0m Workspace: \033[1;34m{str(game['workspace']):<32}\033[0m \033[1;36m│\033[0m",
                 f"\033[1;36m│\033[0m  \033[1mTelemetry:\033[0m   Time: \033[1;32m{game['etime']:<7}\033[0m \033[2m│\033[0m CPU: \033[1;33m{game['cpu']:>4}%\033[0m \033[2m│\033[0m RAM: \033[1;33m{game['mem']:>4}%\033[0m \033[2m│\033[0m VRAM: \033[1;33m{game['vram']:<8}\033[0m \033[1;36m│\033[0m",
-                f"\033[1;36m│\033[0m  \033[1mDaemon:\033[0m      \033[1;32mHeadless Mode\033[0m \033[2m(CEF Disabled / Zero Webhelper Overhead)\033[0m     \033[1;36m│\033[0m",
+                f"\033[1;36m│\033[0m  \033[1mDaemon:\033[0m      \033[1;32mHeadless Mode\033[0m \033[2m(Low-RAM CEF / GPU Disabled / Auto-Reclaim)\033[0m \033[1;36m│\033[0m",
                 "\033[1;36m├──────────────────────────────────────────────────────────────────────────┤\033[0m",
                 "\033[1;36m│\033[0m  \033[1;33m[b]\033[0m Browse Library     \033[1;31m[k]\033[0m Terminate Game     \033[1;37m[q / Esc]\033[0m Detach & Exit   \033[1;36m│\033[0m",
                 "\033[1;36m╰──────────────────────────────────────────────────────────────────────────╯\033[0m",
@@ -1455,6 +1516,14 @@ def show_dashboard():
                 if r:
                     key = sys.stdin.read(1)
                     if key in ('q', '\x1b'):
+                        if target_appid:
+                            backend_bin = os.path.abspath(__file__)
+                            subprocess.Popen(
+                                [sys.executable, backend_bin, "--auto-shutdown", str(target_appid)],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                start_new_session=True
+                            )
                         return 0
                     elif key == 'b':
                         return 2
@@ -1465,7 +1534,7 @@ def show_dashboard():
                         ans = sys.stdin.readline().strip().lower()
                         if ans == 'y':
                             pid = int(game['pid'])
-                            aid = game.get('appid')
+                            aid = game.get('appid') or target_appid
                             try:
                                 # Terminate entire process group to avoid zombie wineserver/helpers
                                 try:
@@ -1481,6 +1550,7 @@ def show_dashboard():
 
                                 sys.stdout.write(f"\033[1;32mSignal sent to terminate {game['name']} and child runtimes.\033[0m\n")
                                 sys.stdout.flush()
+                                safe_post_game_shutdown(aid)
                             except Exception as e:
                                 sys.stdout.write(f"\033[1;31mError killing process: {e}\033[0m\n")
                             return 0
@@ -1557,7 +1627,7 @@ def launch_and_monitor(appid, shortcut_id=None):
                 break
 
     # 5. Enter persistent dashboard monitor
-    show_dashboard()
+    show_dashboard(appid)
 
 def open_steam_gui():
     """Launch Steam with full GUI, wait for user to close the window, then reclaim RAM."""
@@ -1626,7 +1696,8 @@ Options:
   --install <id>                    Headless installation for AppID (EULA bypass)
   --uninstall <id>                  Uninstall game AppID from terminal
   --track-update <id>               Track update/download in terminal without opening Steam GUI
-  --dashboard                       Show interactive session dashboard for running game
+  --dashboard [id]                  Show interactive session dashboard for running game
+  --auto-shutdown <id>              Detached background worker for prefix & cloud sync teardown
   --has-running                     Check if a Steam game is actively running (exit code 0/1)
   --status                          Print JSON status of running game
   --launch-and-monitor <id> [sc_id] Launch game and persistently monitor session
@@ -1682,8 +1753,13 @@ def main():
         game = get_running_steam_game()
         sys.exit(0 if game else 1)
     elif arg == "--dashboard":
-        code = show_dashboard()
+        target = sys.argv[2] if len(sys.argv) > 2 else None
+        code = show_dashboard(target)
         sys.exit(code if code is not None else 0)
+    elif arg == "--auto-shutdown":
+        appid = sys.argv[2] if len(sys.argv) > 2 else None
+        auto_shutdown_watcher(appid)
+        sys.exit(0)
     elif arg == "--status":
         game = get_running_steam_game()
         print(json.dumps(game, indent=2) if game else "null")
