@@ -16,6 +16,8 @@ import urllib.request
 import urllib.parse
 import socket
 import signal
+import time
+import shlex
 from datetime import datetime
 
 STEAM_ROOT = os.path.expanduser("~/.local/share/Steam")
@@ -225,6 +227,337 @@ def get_installed_games():
             app["install_path"] = os.path.join(steamapps_dir, "common", app["installdir"])
             installed[app["appid"]] = app
     return installed
+
+KNOWN_VAC_APPS = {
+    '730',    # Counter-Strike 2
+    '240',    # Counter-Strike: Source
+    '440',    # Team Fortress 2
+    '570',    # Dota 2
+    '252490', # Rust
+    '10',     # Counter-Strike (1.6)
+    '20',     # Team Fortress Classic
+    '30',     # Day of Defeat
+    '40',     # Deathmatch Classic
+    '50',     # Half-Life: Opposing Force
+    '60',     # Ricochet
+    '70',     # Half-Life
+    '80',     # Condition Zero
+    '100',    # Condition Zero Deleted Scenes
+    '130',    # Half-Life: Blue Shift
+    '300',    # Day of Defeat: Source
+}
+
+def classify_anticheat(appid, install_path=None):
+    """Detect whether a game requires official Steam with VAC/EAC/BattlEye, or can run under lightweight shim."""
+    cfg = load_config()
+    if cfg.get("FORCE_OFFICIAL_STEAM") == "1":
+        return {'has_anticheat': True, 'type': 'User Forced Official'}
+
+    allowlist = [x.strip() for x in cfg.get("SHIM_ALLOWLIST", "").split(",") if x.strip()]
+    if str(appid) in allowlist:
+        return {'has_anticheat': False, 'type': None}
+
+    denylist = [x.strip() for x in cfg.get("SHIM_DENYLIST", "").split(",") if x.strip()]
+    if str(appid) in denylist:
+        return {'has_anticheat': True, 'type': 'User Denylisted'}
+
+    if str(appid) in KNOWN_VAC_APPS:
+        return {'has_anticheat': True, 'type': 'Valve Anti-Cheat (VAC)'}
+
+    if not install_path or not os.path.isdir(install_path):
+        installed = get_installed_games()
+        app = installed.get(str(appid))
+        if app and app.get("install_path"):
+            install_path = app["install_path"]
+
+    if not install_path or not os.path.isdir(install_path):
+        return {'has_anticheat': False, 'type': None}
+
+    try:
+        for root, dirs, files in os.walk(install_path):
+            rel_depth = root[len(install_path):].count(os.sep)
+            if rel_depth > 3:
+                continue
+
+            dirs_lower = [d.lower() for d in dirs]
+            if 'easyanticheat' in dirs_lower or 'eac' in dirs_lower:
+                return {'has_anticheat': True, 'type': 'Easy Anti-Cheat (EAC)'}
+            if 'battleye' in dirs_lower:
+                return {'has_anticheat': True, 'type': 'BattlEye (BE)'}
+
+            for f in files:
+                fl = f.lower()
+                if 'easyanticheat' in fl or 'start_protected_game' in fl:
+                    return {'has_anticheat': True, 'type': 'Easy Anti-Cheat (EAC)'}
+                if 'beservice' in fl or 'battleye' in fl:
+                    return {'has_anticheat': True, 'type': 'BattlEye (BE)'}
+                if 'denuvo' in fl:
+                    return {'has_anticheat': True, 'type': 'Denuvo Anti-Cheat'}
+                if 'anticheat' in fl:
+                    return {'has_anticheat': True, 'type': 'Custom Anti-Cheat'}
+    except Exception:
+        pass
+
+    return {'has_anticheat': False, 'type': None}
+
+IGNORED_EXE_NAMES = {
+    'unitycrashhandler64.exe', 'unitycrashhandler32.exe', 'crashreportclient.exe',
+    'crashpad_handler.exe', 'unins000.exe', 'uninstall.exe', 'dxsetup.exe',
+    'regrouplogs.exe', 'vcredist_x64.exe', 'vcredist_x86.exe', 'vc_redist.x64.exe',
+    'vc_redist.x86.exe', 'fossilize_replay.exe', 'dotnetfx35.exe', 'dotnetfx40.exe'
+}
+
+def find_primary_executable(install_path):
+    """Scan install_path and return primary game binary details: dict(path, is_elf, is_exe, name, size)."""
+    if not install_path or not os.path.isdir(install_path):
+        return None
+    candidates = []
+    folder_name = os.path.basename(install_path).lower().replace(' ', '').replace('_', '').replace('-', '')
+    for root, dirs, files in os.walk(install_path):
+        dirs[:] = [d for d in dirs if d.lower() not in ('_commonredist', 'directx', 'support', 'installers', '__installer', 'dotnet')]
+        rel_depth = root[len(install_path):].count(os.sep)
+        if rel_depth > 3:
+            continue
+        for f in files:
+            fl = f.lower()
+            if fl in IGNORED_EXE_NAMES:
+                continue
+            fp = os.path.join(root, f)
+            if os.path.islink(fp) and not os.path.exists(fp):
+                continue
+            is_exe = fl.endswith('.exe')
+            is_elf = False
+            if not is_exe and not any(fl.endswith(ext) for ext in ('.so', '.dll', '.a', '.dylib')):
+                try:
+                    if os.access(fp, os.X_OK) and not os.path.isdir(fp):
+                        with open(fp, 'rb') as tf:
+                            magic = tf.read(4)
+                            if magic == b'\x7fELF' or magic.startswith(b'#!'):
+                                is_elf = True
+                except Exception:
+                    pass
+            if is_exe or is_elf:
+                try:
+                    sz = os.path.getsize(fp)
+                except Exception:
+                    sz = 0
+                score = 0
+                if rel_depth == 0:
+                    score += 50
+                elif rel_depth == 1:
+                    score += 20
+                clean_f = os.path.splitext(fl)[0].replace(' ', '').replace('_', '').replace('-', '')
+                if clean_f == folder_name:
+                    score += 100
+                elif folder_name in clean_f or clean_f in folder_name:
+                    score += 40
+                if sz > 10 * 1024 * 1024:
+                    score += 30
+                elif sz > 1024 * 1024:
+                    score += 15
+                candidates.append((score, sz, fp, is_elf, is_exe))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best = candidates[0]
+    return {
+        'path': best[2],
+        'is_elf': best[3],
+        'is_exe': best[4],
+        'name': os.path.basename(best[2]),
+        'size': best[1]
+    }
+
+def get_proton_binary_path(appid=None):
+    """Find Proton executable path for launching Windows games."""
+    cfg = load_config()
+    custom_proton = cfg.get("PROTON_PATH")
+    if custom_proton and os.path.isfile(custom_proton) and os.access(custom_proton, os.X_OK):
+        return custom_proton
+
+    # Check compatibilitytools.d (e.g. GE-Proton)
+    compat_tools_dir = os.path.expanduser("~/.local/share/Steam/compatibilitytools.d")
+    if os.path.isdir(compat_tools_dir):
+        for tool in sorted(os.listdir(compat_tools_dir), reverse=True):
+            p_bin = os.path.join(compat_tools_dir, tool, "proton")
+            if os.path.isfile(p_bin) and os.access(p_bin, os.X_OK):
+                return p_bin
+
+    # Check library folders for Proton
+    for lib in get_library_folders():
+        common = os.path.join(lib, "steamapps", "common")
+        if not os.path.isdir(common):
+            continue
+        exp_p = os.path.join(common, "Proton - Experimental", "proton")
+        if os.path.isfile(exp_p) and os.access(exp_p, os.X_OK):
+            return exp_p
+        for d in sorted(os.listdir(common), reverse=True):
+            if d.startswith("Proton"):
+                p_bin = os.path.join(common, d, "proton")
+                if os.path.isfile(p_bin) and os.access(p_bin, os.X_OK):
+                    return p_bin
+
+    return None
+
+def get_compat_data_path(appid, install_path=None):
+    """Find or create compatdata prefix directory for Proton."""
+    if install_path:
+        for lib in get_library_folders():
+            if install_path.startswith(lib):
+                cdp = os.path.join(lib, "steamapps", "compatdata", str(appid))
+                if os.path.isdir(cdp):
+                    return cdp
+                os.makedirs(cdp, exist_ok=True)
+                return cdp
+    for lib in get_library_folders():
+        cdp = os.path.join(lib, "steamapps", "compatdata", str(appid))
+        if os.path.isdir(cdp):
+            return cdp
+    fallback = os.path.join(STEAM_ROOT, "steamapps", "compatdata", str(appid))
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+def get_launch_options(appid):
+    """Parse user launch options for given AppID from userdata/*/config/localconfig.vdf."""
+    steam_root = os.path.expanduser("~/.local/share/Steam")
+    userdata_dir = os.path.join(steam_root, "userdata")
+    if not os.path.isdir(userdata_dir):
+        return ""
+    for user_id in os.listdir(userdata_dir):
+        cfg_path = os.path.join(userdata_dir, user_id, "config", "localconfig.vdf")
+        if not os.path.isfile(cfg_path):
+            continue
+        try:
+            with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            for m in re.finditer(r'\"' + str(appid) + r'\"\s*\{', content):
+                open_b = m.end() - 1
+                depth = 1
+                pos = open_b + 1
+                while depth > 0 and pos < len(content):
+                    if content[pos] == '{':
+                        depth += 1
+                    elif content[pos] == '}':
+                        depth -= 1
+                    pos += 1
+                block = content[open_b:pos]
+                m_opts = re.search(r'\"LaunchOptions\"\s*\"([^\"]+)\"', block)
+                if m_opts:
+                    return m_opts.group(1)
+        except Exception:
+            pass
+    return ""
+
+ACTIVE_SESSION_FILE = os.path.expanduser("~/.local/share/steam_tui/active_session.json")
+
+def launch_via_shim(appid, app=None):
+    """Launch a singleplayer/offline title via lightweight compatibility shim (0 MB Steam client RAM)."""
+    import shlex
+    if not app:
+        installed = get_installed_games()
+        app = installed.get(str(appid))
+    if not app:
+        raise ValueError(f"AppID {appid} is not installed.")
+
+    install_path = app.get("install_path")
+    if not install_path or not os.path.isdir(install_path):
+        raise ValueError(f"Game install path not found: {install_path}")
+
+    # 1. Anticheat check
+    ac_info = classify_anticheat(appid, install_path)
+    if ac_info["has_anticheat"]:
+        raise ValueError(f"Game requires official Steam client: {ac_info['type']}")
+
+    # 2. Executable discovery
+    exe_info = find_primary_executable(install_path)
+    if not exe_info:
+        raise ValueError(f"Could not locate primary executable in {install_path}")
+
+    exe_path = exe_info["path"]
+    is_elf = exe_info["is_elf"]
+    name = app.get("name", f"App {appid}")
+
+    # 3. Verify shim infrastructure
+    shim_dir = os.path.expanduser("~/.local/share/steam_tui/shim")
+    if not os.path.isdir(shim_dir):
+        raise ValueError(f"Shim directory does not exist: {shim_dir}")
+
+    # 4. Build execution environment and command
+    env = os.environ.copy()
+    env["SteamAppId"] = str(appid)
+    env["SteamGameId"] = str(appid)
+    env["SteamPath"] = STEAM_ROOT
+    env["SteamUser"] = os.getenv("USER", "john")
+
+    cwd = os.path.dirname(exe_path)
+
+    if is_elf:
+        # Native Linux Game
+        ld_paths = [os.path.join(shim_dir, "x64"), os.path.join(shim_dir, "x32")]
+        curr_ld = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join(ld_paths + ([curr_ld] if curr_ld else []))
+        base_cmd = [exe_path]
+    else:
+        # Windows / Proton Game
+        proton_bin = get_proton_binary_path(appid)
+        if not proton_bin:
+            raise ValueError("No Proton runtime found for Windows title.")
+        compat_data = get_compat_data_path(appid, install_path)
+        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = STEAM_ROOT
+        env["STEAM_COMPAT_DATA_PATH"] = compat_data
+        env["PROTON_DISABLE_LSTEAMCLIENT"] = "1"
+        env["WINEDLLOVERRIDES"] = "steamclient,steamclient64=n,b"
+        env["WINEDLLPATH"] = os.path.join(shim_dir, "proton")
+        base_cmd = [proton_bin, "run", exe_path]
+
+    # 5. User Launch Options (e.g. gamescope, gamemoderun, %command%)
+    opts = get_launch_options(appid)
+    if opts:
+        if "%command%" in opts:
+            cmd_line = opts.replace("%command%", " ".join(shlex.quote(c) for c in base_cmd))
+            final_cmd = ["/bin/sh", "-c", f"exec {cmd_line}"]
+        else:
+            final_cmd = base_cmd + shlex.split(opts)
+    else:
+        final_cmd = base_cmd
+
+    # 6. Inform user
+    print(f"\n\033[1;32m[Lightweight Shim]\033[0m Launching {name} (AppID: {appid}) with 0 MB Steam client overhead...")
+    print(f"\033[2m  Binary:  {os.path.basename(exe_path)} ({'Native Linux' if is_elf else 'Proton Windows'})\033[0m")
+    if opts:
+        print(f"\033[2m  Options: {opts}\033[0m")
+    subprocess.run(["notify-send", "Steam-TUI (Shim)", f"Launching {name} (0 MB client)...", "-i", "steam"], check=False)
+
+    # 7. Spawn process group
+    proc = subprocess.Popen(final_cmd, cwd=cwd, env=env, start_new_session=True)
+
+    # 8. Register active session
+    try:
+        os.makedirs(os.path.dirname(ACTIVE_SESSION_FILE), exist_ok=True)
+        with open(ACTIVE_SESSION_FILE, "w") as sf:
+            json.dump({
+                "appid": str(appid),
+                "name": name,
+                "pid": proc.pid,
+                "mode": "shim",
+                "binary": exe_path,
+                "runtime": "native" if is_elf else "proton",
+                "start_time": time.time()
+            }, sf)
+    except Exception:
+        pass
+
+    try:
+        # Monitor in dashboard
+        show_dashboard(appid)
+    finally:
+        # Cleanup session file on exit
+        if os.path.isfile(ACTIVE_SESSION_FILE):
+            try:
+                os.remove(ACTIVE_SESSION_FILE)
+            except Exception:
+                pass
+    return True
 
 def parse_appinfo_vdf():
     """Parse Steam's local binary appinfo.vdf cache for app metadata (v28/v29 support)."""
@@ -1399,6 +1732,75 @@ def uninstall_app(appid):
 
 def get_running_steam_game():
     """Detect any actively running Steam game on Hyprland / system."""
+    if os.path.isfile(ACTIVE_SESSION_FILE):
+        try:
+            with open(ACTIVE_SESSION_FILE, "r") as sf:
+                sess = json.load(sf)
+            spid = sess.get("pid")
+            aid = sess.get("appid")
+            name = sess.get("name")
+            if spid and os.path.exists(f"/proc/{spid}"):
+                pids_to_check = {str(spid)}
+                try:
+                    c_pids = subprocess.check_output(['pgrep', '-P', str(spid)], stderr=subprocess.DEVNULL).decode('utf-8').strip().split()
+                    pids_to_check.update(c_pids)
+                except Exception:
+                    pass
+
+                cpu, mem, etime = '0.0', '0.0', '00:00'
+                try:
+                    ps_out = subprocess.check_output(['ps', '-p', str(spid), '-o', '%cpu,%mem,etime'], stderr=subprocess.DEVNULL).decode('utf-8').strip().split('\n')
+                    if len(ps_out) > 1:
+                        parts = ps_out[1].split()
+                        cpu, mem, etime = parts[0], parts[1], parts[2]
+                except Exception:
+                    pass
+
+                vram = "N/A"
+                try:
+                    smi_out = subprocess.check_output(['nvidia-smi'], stderr=subprocess.DEVNULL).decode('utf-8')
+                    total_vram_mib = 0
+                    found_vram = False
+                    for line in smi_out.split('\n'):
+                        m = re.search(r'\|\s+\d+\s+(?:N/A|\d+)\s+(?:N/A|\d+)\s+(\d+)\s+([A-Z\+]+)\s+.*?\s+(\d+)MiB', line)
+                        if m and m.group(1) in pids_to_check:
+                            total_vram_mib += int(m.group(3))
+                            found_vram = True
+                    if found_vram:
+                        vram = f"{total_vram_mib / 1024:.1f} GB" if total_vram_mib >= 1024 else f"{total_vram_mib} MB"
+                except Exception:
+                    pass
+
+                workspace = "Shim Session"
+                try:
+                    out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
+                    for c in json.loads(out):
+                        if str(c.get('pid')) in pids_to_check or name.lower() in c.get('title', '').lower():
+                            workspace = c.get('workspace', {}).get('name', 'Shim Session')
+                            break
+                except Exception:
+                    pass
+
+                return {
+                    'appid': aid,
+                    'name': name,
+                    'title': name,
+                    'pid': spid,
+                    'workspace': workspace,
+                    'cpu': cpu,
+                    'mem': mem,
+                    'etime': etime,
+                    'vram': vram,
+                    'mode': 'shim'
+                }
+            else:
+                try:
+                    os.remove(ACTIVE_SESSION_FILE)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     try:
         out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
         clients = json.loads(out)
@@ -1580,7 +1982,13 @@ def show_dashboard(target_appid=None):
     import termios
     import tty
 
-    game = get_running_steam_game()
+    game = None
+    for _ in range(15):
+        game = get_running_steam_game()
+        if game:
+            break
+        time.sleep(0.2)
+
     if not game:
         print("No active Steam game is currently running.")
         return 1
@@ -1596,16 +2004,27 @@ def show_dashboard(target_appid=None):
         if old_settings:
             tty.setcbreak(sys.stdin.fileno())
 
+        is_shim = False
         while True:
             game = get_running_steam_game()
             if not game:
                 sys.stdout.write("\r\033[K\n\033[1;32m✔ Active game session has finished.\033[0m\n\n")
                 sys.stdout.flush()
-                safe_post_game_shutdown(target_appid)
+                if os.path.isfile(ACTIVE_SESSION_FILE):
+                    try:
+                        os.remove(ACTIVE_SESSION_FILE)
+                    except Exception:
+                        pass
+                if not is_shim:
+                    safe_post_game_shutdown(target_appid)
                 return 0
 
-            pss_mb = get_steam_pss_mb()
-            daemon_info = f"Headless Mode (Steam PSS: {pss_mb} MB | Auto-Reclaim Active)"
+            is_shim = (game.get('mode') == 'shim')
+            if is_shim:
+                daemon_info = "Lightweight Shim Mode (0 MB Steam Overhead)"
+            else:
+                pss_mb = get_steam_pss_mb()
+                daemon_info = f"Headless Mode (Steam PSS: {pss_mb} MB | Auto-Reclaim Active)"
             pad_daemon = max(0, 59 - len(daemon_info))
 
             lines = [
@@ -1616,7 +2035,7 @@ def show_dashboard(target_appid=None):
                 f"\033[1;36m│\033[0m  \033[1mGame:\033[0m        \033[1;37m{game['name'][:42]:<42}\033[0m \033[2m(AppID: {game['appid']:<8})\033[0m \033[1;36m│\033[0m",
                 f"\033[1;36m│\033[0m  \033[1mProcess:\033[0m     PID \033[1;33m{str(game['pid']):<8}\033[0m \033[2m│\033[0m Workspace: \033[1;34m{str(game['workspace']):<32}\033[0m \033[1;36m│\033[0m",
                 f"\033[1;36m│\033[0m  \033[1mTelemetry:\033[0m   Time: \033[1;32m{game['etime']:<7}\033[0m \033[2m│\033[0m CPU: \033[1;33m{game['cpu']:>4}%\033[0m \033[2m│\033[0m RAM: \033[1;33m{game['mem']:>4}%\033[0m \033[2m│\033[0m VRAM: \033[1;33m{game['vram']:<8}\033[0m \033[1;36m│\033[0m",
-                f"\033[1;36m│\033[0m  \033[1mDaemon:\033[0m      \033[1;32mHeadless Mode\033[0m \033[2m(Steam PSS: {pss_mb} MB | Auto-Reclaim Active)\033[0m{' ' * pad_daemon}\033[1;36m│\033[0m",
+                f"\033[1;36m│\033[0m  \033[1mDaemon:\033[0m      \033[1;32m{daemon_info}\033[0m{' ' * pad_daemon}\033[1;36m│\033[0m",
                 "\033[1;36m├──────────────────────────────────────────────────────────────────────────┤\033[0m",
                 "\033[1;36m│\033[0m  \033[1;33m[b]\033[0m Browse Library     \033[1;31m[k]\033[0m Terminate Game     \033[1;37m[q / Esc]\033[0m Detach & Exit   \033[1;36m│\033[0m",
                 "\033[1;36m╰──────────────────────────────────────────────────────────────────────────╯\033[0m",
@@ -1629,7 +2048,7 @@ def show_dashboard(target_appid=None):
                 if r:
                     key = sys.stdin.read(1)
                     if key in ('q', '\x1b'):
-                        if target_appid:
+                        if target_appid and not is_shim:
                             backend_bin = os.path.abspath(__file__)
                             subprocess.Popen(
                                 [sys.executable, backend_bin, "--auto-shutdown", str(target_appid)],
@@ -1663,6 +2082,13 @@ def show_dashboard(target_appid=None):
 
                                 sys.stdout.write(f"\033[1;32mSignal sent to terminate {game['name']} and child runtimes.\033[0m\n")
                                 sys.stdout.flush()
+                                if is_shim:
+                                    if os.path.isfile(ACTIVE_SESSION_FILE):
+                                        try:
+                                            os.remove(ACTIVE_SESSION_FILE)
+                                        except Exception:
+                                            pass
+                                    return 0
                                 safe_post_game_shutdown(aid)
                             except Exception as e:
                                 sys.stdout.write(f"\033[1;31mError killing process: {e}\033[0m\n")
@@ -1832,7 +2258,7 @@ def constrain_headless_cef(in_game=False):
         except Exception:
             pass
 
-def launch_and_monitor(appid, shortcut_id=None):
+def launch_and_monitor(appid, shortcut_id=None, force_shim=False):
     """Launch game silently, track update/shaders if needed, and monitor session persistently."""
     import time
     cleanup_stale_steam_locks()
@@ -1845,6 +2271,24 @@ def launch_and_monitor(appid, shortcut_id=None):
             shortcut_id = shortcuts[str(appid)]["shortcut_id"]
 
     name = get_game_name(appid)
+
+    # Dual-Engine Dispatcher
+    cfg = load_config()
+    enable_shim = (cfg.get("ENABLE_LIGHTWEIGHT_SHIM") == "1") or force_shim
+    if cfg.get("FORCE_OFFICIAL_STEAM") == "1":
+        enable_shim = False
+
+    if not is_shortcut and enable_shim:
+        installed = get_installed_games()
+        app = installed.get(str(appid))
+        ac_info = classify_anticheat(appid, app.get("install_path") if app else None)
+        if not ac_info["has_anticheat"]:
+            try:
+                return launch_via_shim(appid, app)
+            except Exception as e:
+                print(f"\n\033[1;33m[Dispatcher Warning] Shim launch failed: {e}. Falling back to official Steam...\033[0m")
+        else:
+            print(f"\n\033[1;36m[Dispatcher]\033[0m Game requires official Steam runtime ({ac_info['type']}). Routing to Valve client...")
 
     if is_shortcut:
         start_headless_daemon()
@@ -2054,6 +2498,42 @@ def main():
         appid = sys.argv[2] if len(sys.argv) > 2 else None
         auto_shutdown_watcher(appid)
         sys.exit(0)
+    elif arg == "--check-ac":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --check-ac requires <appid>\n")
+            sys.exit(1)
+        res = classify_anticheat(sys.argv[2])
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if not res['has_anticheat'] else 2)
+    elif arg == "--test-shim":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --test-shim requires <appid> [--run]\n")
+            sys.exit(1)
+        appid = sys.argv[2]
+        installed = get_installed_games()
+        app = installed.get(str(appid))
+        if not app:
+            sys.stderr.write(f"AppID {appid} is not installed.\n")
+            sys.exit(1)
+        ac = classify_anticheat(appid, app.get("install_path"))
+        exe = find_primary_executable(app.get("install_path"))
+        opts = get_launch_options(appid)
+        proton = get_proton_binary_path(appid) if exe and not exe["is_elf"] else None
+        plan = {
+            "appid": appid,
+            "name": app.get("name"),
+            "has_anticheat": ac["has_anticheat"],
+            "anticheat_type": ac["type"],
+            "shim_eligible": not ac["has_anticheat"],
+            "executable": exe,
+            "runtime": "native" if exe and exe["is_elf"] else ("proton" if exe else "unknown"),
+            "proton_bin": proton,
+            "launch_options": opts
+        }
+        print(json.dumps(plan, indent=2))
+        if "--run" in sys.argv:
+            launch_via_shim(appid, app)
+        sys.exit(0)
     elif arg == "--status":
         game = get_running_steam_game()
         print(json.dumps(game, indent=2) if game else "null")
@@ -2061,8 +2541,14 @@ def main():
         if len(sys.argv) < 3:
             sys.stderr.write("Error: --launch-and-monitor requires <appid>\n")
             sys.exit(1)
-        shortcut_id = sys.argv[3] if len(sys.argv) > 3 else None
-        launch_and_monitor(sys.argv[2], shortcut_id)
+        shortcut_id = None
+        force_shim = False
+        for a in sys.argv[3:]:
+            if a == "--shim":
+                force_shim = True
+            elif not shortcut_id:
+                shortcut_id = a
+        launch_and_monitor(sys.argv[2], shortcut_id, force_shim=force_shim)
     elif arg == "--edit-launch-options":
         if len(sys.argv) < 3:
             sys.stderr.write("Error: --edit-launch-options requires <appid>\n")
