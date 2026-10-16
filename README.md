@@ -29,6 +29,7 @@ Intercepts interactive terminal calls to `steam` to deliver an instantaneous, ke
   - `q`: Detach monitor and exit terminal
 - **Terminal Uninstallation**: Press `Ctrl-X` inside `fzf` to cleanly dispatch `+app_uninstall` without touching the GUI.
 - **Self-Healing Lock Recovery**: Automatically diagnoses and clears orphaned FIFO pipes (`steam.pipe`) and stale PID locks (`steam.pid`) that otherwise cause Steam to hang indefinitely after GUI exits.
+- **Vanilla & Millennium Compatible**: Fully compatible with standard vanilla Steam as well as Millennium Steam client mods. Automatically detects and preserves `MILLENNIUM_RUNTIME_PATH` to prevent `libXtst.so.6` crash loops while remaining 100% zero-config and dependency-free for stock Steam users.
 - **Transparent Passthrough**:
   - `steam <args>` passes through directly to `/usr/bin/steam "$@"`.
   - `steam --gui` summons the native Steam graphical interface.
