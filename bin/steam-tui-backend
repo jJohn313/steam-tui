@@ -247,8 +247,34 @@ KNOWN_VAC_APPS = {
     '300',    # Day of Defeat: Source
 }
 
+def has_steamstub_drm(exe_path):
+    """Detect Valve SteamStub DRM (.bind or .steam PE section) in a Windows executable."""
+    if not exe_path or not exe_path.lower().endswith('.exe') or not os.path.isfile(exe_path):
+        return False
+    try:
+        with open(exe_path, 'rb') as f:
+            header = f.read(4096)
+        if len(header) < 64 or header[:2] != b'MZ':
+            return False
+        pe_offset = struct.unpack('<I', header[0x3c:0x40])[0]
+        if pe_offset + 24 > len(header) or header[pe_offset:pe_offset+4] != b'PE\0\0':
+            return False
+        num_sections = struct.unpack('<H', header[pe_offset+6:pe_offset+8])[0]
+        opt_header_size = struct.unpack('<H', header[pe_offset+20:pe_offset+22])[0]
+        sec_offset = pe_offset + 24 + opt_header_size
+        for _ in range(num_sections):
+            if sec_offset + 40 > len(header):
+                break
+            sec_name = header[sec_offset:sec_offset+8].rstrip(b'\0').decode('latin1', errors='ignore')
+            if sec_name in ('.bind', '.steam'):
+                return True
+            sec_offset += 40
+    except Exception:
+        pass
+    return False
+
 def classify_anticheat(appid, install_path=None):
-    """Detect whether a game requires official Steam with VAC/EAC/BattlEye, or can run under lightweight shim."""
+    """Detect whether a game requires official Steam with VAC/EAC/BattlEye/SteamStub DRM, or can run under lightweight shim."""
     cfg = load_config()
     if cfg.get("FORCE_OFFICIAL_STEAM") == "1":
         return {'has_anticheat': True, 'type': 'User Forced Official'}
@@ -295,6 +321,10 @@ def classify_anticheat(appid, install_path=None):
                     return {'has_anticheat': True, 'type': 'Denuvo Anti-Cheat'}
                 if 'anticheat' in fl:
                     return {'has_anticheat': True, 'type': 'Custom Anti-Cheat'}
+                if fl.endswith('.exe') and fl not in IGNORED_EXE_NAMES:
+                    fp = os.path.join(root, f)
+                    if has_steamstub_drm(fp):
+                        return {'has_anticheat': True, 'type': 'Valve SteamStub DRM'}
     except Exception:
         pass
 
@@ -470,9 +500,9 @@ def get_launch_options(appid):
                         depth -= 1
                     pos += 1
                 block = content[open_b:pos]
-                m_opts = re.search(r'\"LaunchOptions\"\s*\"([^\"]+)\"', block)
+                m_opts = re.search(r'^\s*\"LaunchOptions\"\s*\"(.*)\"\s*$', block, re.MULTILINE)
                 if m_opts:
-                    return m_opts.group(1)
+                    return m_opts.group(1).replace(r'\"', '"').strip()
         except Exception:
             pass
     return ""
@@ -631,12 +661,12 @@ def launch_via_shim(appid, app=None):
         clean_opts = opts.rstrip('\\ ')
         if "%command%" in clean_opts:
             cmd_line = clean_opts.replace("%command%", " ".join(shlex.quote(c) for c in base_cmd))
-            final_cmd = ["/bin/sh", "-c", f"exec {cmd_line}"]
+            final_cmd = ["/bin/sh", "-c", cmd_line]
         else:
             try:
                 final_cmd = base_cmd + shlex.split(clean_opts)
             except Exception:
-                final_cmd = ["/bin/sh", "-c", f"exec {' '.join(shlex.quote(c) for c in base_cmd)} {clean_opts}"]
+                final_cmd = ["/bin/sh", "-c", f"{' '.join(shlex.quote(c) for c in base_cmd)} {clean_opts}"]
     else:
         final_cmd = base_cmd
 
@@ -927,9 +957,9 @@ def edit_launch_options(appid):
     m = re.search(app_pat, content)
     if m:
         body = m.group(2)
-        m_opts = re.search(r'\"LaunchOptions\"\s+\"([^\"]*)\"', body)
+        m_opts = re.search(r'^\s*\"LaunchOptions\"\s*\"(.*)\"\s*$', body, re.MULTILINE)
         if m_opts:
-            cur_opts = m_opts.group(1)
+            cur_opts = m_opts.group(1).replace(r'\"', '"').strip()
 
     print("\n" + "=" * 65)
     print(f"  ⚙️  Launch Options for \033[1;36m{name}\033[0m (AppID: {appid})")
@@ -959,10 +989,11 @@ def edit_launch_options(appid):
 
     if m:
         body = m.group(2)
-        if re.search(r'\"LaunchOptions\"\s+\"[^\"]*\"', body):
-            new_body = re.sub(r'\"LaunchOptions\"\s+\"[^\"]*\"', f'"LaunchOptions"\t\t"{new_opts}"', body)
+        escaped_opts = new_opts.replace('"', r'\"')
+        if re.search(r'^\s*\"LaunchOptions\"\s*\".*\"', body, re.MULTILINE):
+            new_body = re.sub(r'^\s*\"LaunchOptions\"\s*\".*\"', f'\t\t\t\t\t\t"LaunchOptions"\t\t"{escaped_opts}"', body, flags=re.MULTILINE)
         elif new_opts:
-            new_body = f'\n\t\t\t\t\t\t"LaunchOptions"\t\t"{new_opts}"' + body
+            new_body = f'\n\t\t\t\t\t\t"LaunchOptions"\t\t"{escaped_opts}"' + body
         else:
             new_body = body
         new_content = content[:m.start(2)] + new_body + content[m.end(2):]
@@ -1880,52 +1911,94 @@ def get_running_steam_game():
                 except Exception:
                     pass
 
-                cpu, mem, etime = '0.0', '0.0', '00:00'
-                try:
-                    ps_out = subprocess.check_output(['ps', '-p', str(spid), '-o', '%cpu,%mem,etime'], stderr=subprocess.DEVNULL).decode('utf-8').strip().split('\n')
-                    if len(ps_out) > 1:
-                        parts = ps_out[1].split()
-                        cpu, mem, etime = parts[0], parts[1], parts[2]
-                except Exception:
-                    pass
+                # Verify whether the game process or its window is actually alive
+                bin_name = os.path.basename(sess.get("binary", ""))
+                elapsed = time.time() - sess.get("start_time", 0)
+                is_alive = True
+                if bin_name and elapsed > 5:
+                    has_bin = False
+                    try:
+                        r = subprocess.run(["pgrep", "-f", "-i", bin_name], stdout=subprocess.DEVNULL)
+                        if r.returncode == 0:
+                            has_bin = True
+                    except Exception:
+                        pass
 
-                vram = "N/A"
-                try:
-                    smi_out = subprocess.check_output(['nvidia-smi'], stderr=subprocess.DEVNULL).decode('utf-8')
-                    total_vram_mib = 0
-                    found_vram = False
-                    for line in smi_out.split('\n'):
-                        m = re.search(r'\|\s+\d+\s+(?:N/A|\d+)\s+(?:N/A|\d+)\s+(\d+)\s+([A-Z\+]+)\s+.*?\s+(\d+)MiB', line)
-                        if m and m.group(1) in pids_to_check:
-                            total_vram_mib += int(m.group(3))
-                            found_vram = True
-                    if found_vram:
-                        vram = f"{total_vram_mib / 1024:.1f} GB" if total_vram_mib >= 1024 else f"{total_vram_mib} MB"
-                except Exception:
-                    pass
+                    has_win = False
+                    try:
+                        out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
+                        for c in json.loads(out):
+                            if str(c.get('pid')) in pids_to_check or (name and name.lower() in (c.get('title') or '').lower()):
+                                has_win = True
+                                break
+                    except Exception:
+                        pass
 
-                workspace = "Shim Session"
-                try:
-                    out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
-                    for c in json.loads(out):
-                        if str(c.get('pid')) in pids_to_check or name.lower() in c.get('title', '').lower():
-                            workspace = c.get('workspace', {}).get('name', 'Shim Session')
-                            break
-                except Exception:
-                    pass
+                    if not has_bin and not has_win:
+                        is_alive = False
 
-                return {
-                    'appid': aid,
-                    'name': name,
-                    'title': name,
-                    'pid': spid,
-                    'workspace': workspace,
-                    'cpu': cpu,
-                    'mem': mem,
-                    'etime': etime,
-                    'vram': vram,
-                    'mode': 'shim'
-                }
+                if is_alive:
+                    cpu, mem, etime = '0.0', '0.0', '00:00'
+                    try:
+                        ps_out = subprocess.check_output(['ps', '-p', str(spid), '-o', '%cpu,%mem,etime'], stderr=subprocess.DEVNULL).decode('utf-8').strip().split('\n')
+                        if len(ps_out) > 1:
+                            parts = ps_out[1].split()
+                            cpu, mem, etime = parts[0], parts[1], parts[2]
+                    except Exception:
+                        pass
+
+                    vram = "N/A"
+                    try:
+                        smi_out = subprocess.check_output(['nvidia-smi'], stderr=subprocess.DEVNULL).decode('utf-8')
+                        total_vram_mib = 0
+                        found_vram = False
+                        for line in smi_out.split('\n'):
+                            m = re.search(r'\|\s+\d+\s+(?:N/A|\d+)\s+(?:N/A|\d+)\s+(\d+)\s+([A-Z\+]+)\s+.*?\s+(\d+)MiB', line)
+                            if m and m.group(1) in pids_to_check:
+                                total_vram_mib += int(m.group(3))
+                                found_vram = True
+                        if found_vram:
+                            vram = f"{total_vram_mib / 1024:.1f} GB" if total_vram_mib >= 1024 else f"{total_vram_mib} MB"
+                    except Exception:
+                        pass
+
+                    workspace = "Shim Session"
+                    try:
+                        out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
+                        for c in json.loads(out):
+                            if str(c.get('pid')) in pids_to_check or name.lower() in c.get('title', '').lower():
+                                workspace = c.get('workspace', {}).get('name', 'Shim Session')
+                                break
+                    except Exception:
+                        pass
+
+                    return {
+                        'appid': aid,
+                        'name': name,
+                        'title': name,
+                        'pid': spid,
+                        'workspace': workspace,
+                        'cpu': cpu,
+                        'mem': mem,
+                        'etime': etime,
+                        'vram': vram,
+                        'mode': 'shim'
+                    }
+                else:
+                    if os.path.isfile(ACTIVE_SESSION_FILE):
+                        try:
+                            os.remove(ACTIVE_SESSION_FILE)
+                        except Exception:
+                            pass
+                    try:
+                        os.kill(int(spid), signal.SIGTERM)
+                    except Exception:
+                        pass
+                    if sess.get("runtime") == "proton":
+                        try:
+                            subprocess.run(["killall", "-9", "wineserver", "winedevice.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            pass
             else:
                 try:
                     os.remove(ACTIVE_SESSION_FILE)
@@ -2043,6 +2116,11 @@ def get_running_steam_game():
 def safe_post_game_shutdown(appid=None):
     """Wait for Proton prefix teardown and Cloud Sync completion before shutting down Steam."""
     import time
+    res = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL)
+    if res.returncode != 0:
+        cleanup_stale_steam_locks()
+        return
+
     sys.stdout.write("\033[1;34mWaiting for Proton prefix & Steam Cloud sync to finish...\033[0m")
     sys.stdout.flush()
 
@@ -2083,13 +2161,14 @@ def safe_post_game_shutdown(appid=None):
         return
 
     print("\r\033[K\033[1;32m✔ Cloud saves synced. Shutting down Steam daemon (0 MB idle)...\033[0m")
-    subprocess.run([REAL_STEAM, "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(10):
-        time.sleep(0.5)
-        if subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL).returncode != 0:
-            break
-    else:
-        subprocess.run(["pkill", "-9", "-f", "ubuntu12_32/steam|steamwebhelper"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL).returncode == 0:
+        subprocess.run([REAL_STEAM, "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(10):
+            time.sleep(0.5)
+            if subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL).returncode != 0:
+                break
+        else:
+            subprocess.run(["pkill", "-9", "-f", "ubuntu12_32/steam|steamwebhelper|srt-logger"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     cleanup_stale_steam_locks()
 
 def auto_shutdown_watcher(appid=None):
@@ -2221,6 +2300,8 @@ def show_dashboard(target_appid=None):
                                             os.remove(ACTIVE_SESSION_FILE)
                                         except Exception:
                                             pass
+                                    subprocess.run(["killall", "-9", "wineserver", "winedevice.exe"],
+                                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                                     return 0
                                 safe_post_game_shutdown(aid)
                             except Exception as e:
@@ -2232,6 +2313,42 @@ def show_dashboard(target_appid=None):
     finally:
         if old_settings:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+def acknowledge_steam_interstitials():
+    """Call SteamClient.Apps.ContinueGameAction on SharedJSContext via CDP to auto-pass launch dialogs."""
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8080/json", headers={"User-Agent": "steam-tui"})
+        with urllib.request.urlopen(req, timeout=0.6) as resp:
+            targets = json.loads(resp.read().decode("utf-8"))
+        for t in targets:
+            if "SharedJSContext" in t.get("title", "") or "SharedJSContext" in t.get("url", ""):
+                ws = t.get("webSocketDebuggerUrl")
+                if ws:
+                    js_code = "for(let i=1; i<=15; i++){ try { SteamClient.Apps.ContinueGameAction(i, ''); } catch(e){} }"
+                    cdp_send(ws, {
+                        "id": 999,
+                        "method": "Runtime.evaluate",
+                        "params": {"expression": js_code}
+                    })
+    except Exception:
+        pass
+
+def close_unwanted_steam_windows():
+    """Close any intrusive Steam popup windows in Hyprland (chat, friends list, news)."""
+    try:
+        h_out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
+        for c in json.loads(h_out):
+            cls = (c.get('class') or '').lower()
+            init_cls = (c.get('initialClass') or '').lower()
+            title = (c.get('title') or '').lower()
+            if cls in ('steam', 'steamwebhelper') or init_cls in ('steam', 'steamwebhelper'):
+                if any(k in title for k in ['friends list', 'chat', 'news', 'special offers', 'steam community']):
+                    addr = c.get('address')
+                    if addr:
+                        subprocess.run(['hyprctl', 'dispatch', 'closewindow', f'address:{addr}'],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 def constrain_headless_cef(in_game=False):
     """Surgical CEF and Steam daemon memory reducer for headless mode:
@@ -2297,46 +2414,26 @@ def constrain_headless_cef(in_game=False):
             for t in targets:
                 title = t.get("title", "")
                 url = t.get("url", "")
-                tid = t.get("id")
                 ws = t.get("webSocketDebuggerUrl")
                 # Do NOT touch SharedJSContext (required for Steamworks DRM, Steam Input, Cloud Sync)
                 if "SharedJSContext" in title or "SharedJSContext" in url:
                     continue
 
-                # Preserve SP Desktop during pre-launch so game launch interstitials function
+                # Preserve SP Desktop and loopback pages during pre-launch so game launch interstitials function
                 is_sp_desktop = (
                     "sp desktop" in title.lower()
                     or "steam" in title.lower()
                     or "steamloopback.host" in url.lower()
                 )
-                is_chat_or_popup = any(k in title.lower() or k in url.lower() for k in ["chat", "friends", "notification", "broadcast", "news", "special offers"])
-                if is_chat_or_popup:
-                    is_sp_desktop = False
                 if not in_game and is_sp_desktop:
                     continue
 
-                if ws:
+                # Only blank external web pages (Store, Community, etc.), NEVER close or blank loopback pages
+                if ws and not "steamloopback.host" in url.lower():
                     cdp_send(ws, {"id": 1, "method": "Page.navigate", "params": {"url": "about:blank"}})
-                if tid:
-                    try:
-                        close_req = urllib.request.Request(f"http://127.0.0.1:8080/json/close/{tid}")
-                        urllib.request.urlopen(close_req, timeout=0.5)
-                    except Exception:
-                        pass
 
         # In Hyprland, close any popup chat/friends/notification windows
-        try:
-            h_out = subprocess.check_output(['hyprctl', '-j', 'clients'], stderr=subprocess.DEVNULL).decode('utf-8')
-            for c in json.loads(h_out):
-                if c.get('class') == 'steam':
-                    t_low = (c.get('title') or '').lower()
-                    if any(k in t_low for k in ['chat', 'friends', 'news', 'notification', 'special offers']):
-                        addr = c.get('address')
-                        if addr:
-                            subprocess.run(['hyprctl', 'dispatch', 'closewindow', f'address:{addr}'],
-                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+        close_unwanted_steam_windows()
     except Exception:
         pass
 
@@ -2438,7 +2535,12 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
             except Exception as e:
                 print(f"\n\033[1;33m[Dispatcher Warning] Shim launch failed: {e}. Falling back to official Steam...\033[0m")
         else:
-            print(f"\n\033[1;36m[Dispatcher]\033[0m Game requires official Steam runtime ({ac_info['type']}). Routing to Valve client...")
+            if force_shim and ac_info.get("type") == "Valve SteamStub DRM":
+                print(f"\n\033[1;33m[Dispatcher Notice]\033[0m Game executable is packed with Valve SteamStub DRM (.bind section).")
+                print(f"  Shim mode cannot run SteamStub DRM without crashing (Error 3:0000065432).")
+                print(f"  Routing to official minimal Steam client...\n")
+            else:
+                print(f"\n\033[1;36m[Dispatcher]\033[0m Game requires official Steam runtime ({ac_info['type']}). Routing to Valve client...")
 
     if is_shortcut:
         start_headless_daemon()
@@ -2470,8 +2572,15 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
     sys.stdout.flush()
 
     start_wait = time.time()
+    last_action_check = 0
     while time.time() - start_wait < 120:
         time.sleep(0.5)
+        now = time.time()
+        if now - last_action_check >= 1.5:
+            last_action_check = now
+            acknowledge_steam_interstitials()
+            close_unwanted_steam_windows()
+
         foz = subprocess.run(["pgrep", "-f", "fossilize_replay"], stdout=subprocess.DEVNULL)
         if foz.returncode == 0:
             sys.stdout.write("\r\033[K\033[1;33m[Vulkan Shaders] Fossilize compiling pipelines in background...\033[0m")
@@ -2485,7 +2594,7 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
         # Check if steam launch helper or wine is still running
         reaper = subprocess.run(["pgrep", "-f", f"AppId={appid}"], stdout=subprocess.DEVNULL)
         wine_init = subprocess.run(["pgrep", "-f", "wineserver"], stdout=subprocess.DEVNULL)
-        if reaper.returncode != 0 and wine_init.returncode != 0 and (time.time() - start_wait > 20):
+        if reaper.returncode != 0 and wine_init.returncode != 0 and (time.time() - start_wait > 25):
             if game:
                 break
             if time.time() - start_wait > 35:
