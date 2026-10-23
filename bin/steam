@@ -8,9 +8,20 @@ else
     BACKEND="$HOME/.local/bin/steam-tui-backend"
 fi
 
-# Auto-recover from stale Steam FIFO pipes and PID locks
+# Auto-recover from stale Steam FIFO pipes, PID locks, and headless ghost daemons
 STEAM_PID_FILE="${HOME}/.steam/steam.pid"
 STEAM_PIPE_FILE="${HOME}/.steam/steam.pipe"
+
+if pgrep -u "$USER" -x "steam" >/dev/null 2>&1; then
+    # If steam is running but steamwebhelper is missing and no game is active, kill the ghost
+    if ! pgrep -u "$USER" -x "steamwebhelper" >/dev/null 2>&1; then
+        if ! "$BACKEND" --has-running >/dev/null 2>&1; then
+            pkill -u "$USER" -9 -x "steam" 2>/dev/null
+            rm -f "$STEAM_PID_FILE" "$STEAM_PIPE_FILE" "${HOME}/.local/share/Steam/steam.pid" "${HOME}/.local/share/Steam/steam.pipe"
+        fi
+    fi
+fi
+
 if [[ -f "$STEAM_PID_FILE" ]]; then
     OLD_PID=$(cat "$STEAM_PID_FILE" 2>/dev/null)
     if [[ -n "$OLD_PID" ]] && ! kill -0 "$OLD_PID" 2>/dev/null; then
@@ -22,9 +33,18 @@ elif [[ -p "$STEAM_PIPE_FILE" ]]; then
     fi
 fi
 
-# 1. Passthrough: Explicit GUI launch
+# 1. Passthrough: Explicit GUI launch & file management helpers
 if [[ "$1" == "--gui" || "$1" == "-gui" ]]; then
     exec "$BACKEND" --open-gui
+elif [[ "$1" == "--files" || "$1" == "-f" ]]; then
+    shift
+    exec "$BACKEND" --files-menu "$@"
+elif [[ "$1" == "--open-dir" || "$1" == "--browse" ]]; then
+    shift
+    exec "$BACKEND" --open-dir "$@"
+elif [[ "$1" == "--open-saves" || "$1" == "--saves" ]]; then
+    shift
+    exec "$BACKEND" --open-saves "$@"
 elif [[ $# -gt 0 ]]; then
     if ! pgrep -u "$USER" -x "steam" >/dev/null 2>&1; then
         "$BACKEND" --ensure-daemon >/dev/null 2>&1
@@ -70,7 +90,7 @@ while true; do
         --prompt=" Search ❯ " \
         --pointer="▶" \
         --color="bg+:#1e1e2e,fg+:#cdd6f4,hl:#f38ba8,hl+:#f38ba8,border:#89b4fa,label:#89b4fa,prompt:#cba6f7,pointer:#f5e0dc,header:#6c7086" \
-        --header="ENTER: Auto Launch │ Ctrl-S: Force Official Steam │ Ctrl-Z: Force 0 MB Shim │ Ctrl-O: Launch Options │ Ctrl-P: Proton │ Ctrl-X: Uninstall" \
+        --header="ENTER: Launch │ Ctrl-F: Files & Saves │ Ctrl-O: Launch Options │ Ctrl-P: Proton │ Ctrl-S: Steam │ Ctrl-Z: Shim" \
         --preview="$BACKEND --preview {2} {3}" \
         --preview-window="right:48%:border-left:wrap" \
         --bind="ctrl-r:reload($BACKEND --sync >/dev/null 2>&1 && $BACKEND --list)" \
