@@ -21,7 +21,9 @@ Intercepts interactive terminal calls to `steam` to deliver an instantaneous, ke
 
 ### 🎮 Keyboard-Driven Terminal Power
 - **Instant FZF Launcher**: Lightning-fast fuzzy search across all libraries, secondary drives, and non-Steam shortcuts with Kitty true-color box art preview.
-- **In-TUI Settings & Prefix Manager**: Inline launch options editor (`Ctrl-O`), Proton compatibility switcher (`Ctrl-P`), and direct prefix/save directory manager (`Ctrl-F`).
+- **Deep Files & Save Data Hub (`Ctrl-F`)**: Browse game installation directories and pinpoint exact save file locations without opening native Steam. Seamlessly compatible with **Yazi** (`yazi-dolphin` TUI), **KDE Dolphin** (GUI), or system default (`xdg-open`).
+- **Automatic Save Path Discovery**: Intelligently scans and detects game-specific save folders across Proton prefixes (`Documents/My Games`, `Saved Games`, `AppData/Local`, `AppData/Roaming`, `AppData/LocalLow`), Steam Cloud `userdata`, and native Linux locations.
+- **In-TUI Settings & Prefix Manager**: Inline launch options editor (`Ctrl-O`), Proton compatibility switcher (`Ctrl-P`), and wine runtime tools (`winecfg`, WINEPREFIX terminal).
 - **Headless Installation & EULA Bypass**: Install games across target drives via terminal without webview prompts or multi-step wizard modals.
 - **Live Session Dashboard & HUD**: Real-time CPU, RAM, VRAM, and runtime tracking with interactive session controls (`k` to kill, `b` to background, `q` to detach).
 - **Terminal Uninstallation**: Press `Ctrl-X` inside `fzf` to cleanly dispatch `+app_uninstall` without touching the GUI.
@@ -94,7 +96,7 @@ steam -silent -applaunch 730
 | `<Ctrl+A>` | Resets filter to show **All games** (installed + uninstalled + shortcuts). |
 | `<Ctrl+O>` | Opens inline editor for per-game **Launch Options** (`localconfig.vdf`). |
 | `<Ctrl+P>` | Selects Proton / GE-Proton **Compatibility Tool** (`config.vdf`). |
-| `<Ctrl+F>` | Opens **Prefix & Files Menu** (game dir, prefix `drive_c`, `AppData`, `winecfg`, and **Save Data Sync**). |
+| `<Ctrl+F>` | Opens **Files & Saves Hub**: Browse game directory, pinpoint save files, open Proton prefix (`drive_c`), inspect Steam Cloud userdata, or launch `winecfg` using **Yazi** (`yazi-dolphin` TUI), **Dolphin** (GUI), or `xdg-open`. |
 | `<Ctrl+X>` | Prompts to **Uninstall selected game** directly from terminal. |
 | `<Ctrl+R>` | Rescans library drives, parses manifests, refreshes cache, and live-reloads list. |
 | `<ESC>` / `<Ctrl+C>` | Exits launcher without starting Steam. |
@@ -144,8 +146,17 @@ steam-tui-backend --edit-launch-options 1091500
 # Open interactive Proton compatibility tool selector
 steam-tui-backend --set-proton 1091500
 
-# Open prefix and files navigation menu (with save sync)
+# Open Files & Saves Hub (accepts AppID or game name substring; interactive picker if omitted)
 steam-tui-backend --files-menu 1091500
+steam-tui-backend --files-menu "NieR Replicant"
+steam -f "NieR Replicant"
+steam -f
+
+# Directly open game installation or save directory in preferred file manager (yazi, dolphin, xdg)
+steam --browse 1091500 yazi
+steam --saves 1091500 dolphin
+steam-tui-backend --open-dir 1091500 yazi
+steam-tui-backend --open-saves 1091500 dolphin
 
 # Open live dashboard for already-running game
 steam-tui-backend --dashboard
@@ -180,6 +191,10 @@ ENABLE_LIGHTWEIGHT_SHIM=1
 # 1 = Force official Steam client globally for all launches
 # 0 = Allow intelligent anti-cheat classifier to choose the optimal engine
 FORCE_OFFICIAL_STEAM=0
+
+# Preferred file manager for opening game installation and save directories
+# Options: "auto" (default: yazi / yazi-dolphin if available, else Dolphin/xdg-open), "yazi", "dolphin", "xdg-open"
+DEFAULT_FILE_MANAGER="auto"
 
 # Optional: Provide Steam Web API Key & SteamID64 for cloud library synchronization
 # STEAM_API_KEY=""
