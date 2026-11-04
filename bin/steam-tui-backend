@@ -2063,14 +2063,14 @@ def list_games():
     for app in installed_sorted:
         sf = app.get("state_flags", 4)
         if sf & 1024:
-            display_label = f"\033[1;36m[UPDATING]\033[0m    {app['name']}"
-            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATING\t")
+            display_label = f"\033[38;2;137;220;235m◐ Updating\033[0m    {app['name']}"
+            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATING\t\t{app['name']}")
         elif sf & 2:
-            display_label = f"\033[1;33m[UPDATE]\033[0m      {app['name']}"
-            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATE_REQUIRED\t")
+            display_label = f"\033[38;2;250;179;135m▲ Update\033[0m      {app['name']}"
+            output_lines.append(f"{display_label}\t{app['appid']}\tUPDATE_REQUIRED\t\t{app['name']}")
         else:
-            display_label = f"\033[1;32m[INSTALLED]\033[0m   {app['name']}"
-            output_lines.append(f"{display_label}\t{app['appid']}\tINSTALLED\t")
+            display_label = f"\033[38;2;166;227;161m● Ready\033[0m       {app['name']}"
+            output_lines.append(f"{display_label}\t{app['appid']}\tINSTALLED\t\t{app['name']}")
 
     # 2. Non-Steam Shortcuts
     shortcuts = get_non_steam_shortcuts()
@@ -2078,9 +2078,14 @@ def list_games():
         shortcuts.values(),
         key=lambda x: x["name"].lower()
     )
+    seen_sc = set()
     for sc in shortcuts_sorted:
-        display_label = f"\033[1;35m[SHORTCUT]\033[0m    {sc['name']}"
-        output_lines.append(f"{display_label}\t{sc['appid']}\tSHORTCUT\t{sc['shortcut_id']}")
+        sc_aid = sc["appid"]
+        if sc_aid in seen_sc:
+            continue
+        seen_sc.add(sc_aid)
+        display_label = f"\033[38;2;203;166;247m◆ Shortcut\033[0m    {sc['name']}"
+        output_lines.append(f"{display_label}\t{sc['appid']}\tSHORTCUT\t{sc['shortcut_id']}\t{sc['name']}")
 
     # 3. Available (Uninstalled Owned) games
     installed_ids = set(installed.keys())
@@ -2096,8 +2101,8 @@ def list_games():
         key=lambda x: x["name"].lower()
     )
     for app in available_sorted:
-        display_label = f"\033[1;34m[AVAILABLE]\033[0m   {app['name']}"
-        output_lines.append(f"{display_label}\t{app['appid']}\tAVAILABLE\t")
+        display_label = f"\033[38;2;108;112;134m○ Library\033[0m     \033[38;2;147;153;178m{app['name']}\033[0m"
+        output_lines.append(f"{display_label}\t{app['appid']}\tAVAILABLE\t\t{app['name']}")
 
     return "\n".join(output_lines)
 
@@ -2458,12 +2463,19 @@ def show_preview(appid, status=None):
         sys.stdout.write("\033_Ga=d,d=A\033\\")
         sys.stdout.flush()
 
+        try:
+            p_cols = int(os.environ.get("FZF_PREVIEW_COLUMNS", "54"))
+        except Exception:
+            p_cols = 54
+        card_w = max(42, min(p_cols - 2, 84))
+
         if chosen_img and os.path.isfile(chosen_img):
-            cols = os.environ.get("FZF_PREVIEW_COLUMNS", "44")
-            size_arg = config.get("CHAFA_SIZE", f"{cols}x12")
+            img_w = card_w
+            img_h = max(8, min(14, int(img_w * 0.34)))
+            size_arg = config.get("CHAFA_SIZE", f"{img_w}x{img_h}")
             if shutil.which("chafa"):
                 subprocess.run(
-                    ["chafa", "-f", "kitty", "--passthrough=none", "--size", size_arg, chosen_img],
+                    ["chafa", "-f", "kitty", "--passthrough=none", f"--size={size_arg}", chosen_img],
                     check=False
                 )
                 print()
@@ -2472,73 +2484,92 @@ def show_preview(appid, status=None):
                     "kitten", "icat",
                     "--clear",
                     "--transfer-mode=memory",
-                    "--unicode-placeholder",
                     "--stdin=no",
-                    f"--place={cols}x12@0x0",
                     chosen_img
                 ], check=False)
-                print("\n" * 12)
+                print()
 
-    # Metadata Card
-    print(f"\033[1;36m╭──────────────────────────────────────────────────╮\033[0m")
-    print(f"\033[1;36m│\033[0m \033[1mTitle:\033[0m    \033[1;37m{title[:37]}\033[0m")
-    print(f"\033[1;36m│\033[0m \033[1mAppID:\033[0m    \033[1;33m{appid}\033[0m")
+    # Dynamic Card Formatting
+    try:
+        p_cols = int(os.environ.get("FZF_PREVIEW_COLUMNS", "54"))
+    except Exception:
+        p_cols = 54
+    card_w = max(42, min(p_cols - 2, 84))
+    sep = "─" * card_w
 
-    compat = get_compat_tool(appid)
-    print(f"\033[1;36m│\033[0m \033[1mRuntime:\033[0m  \033[1;35m{compat[:37]}\033[0m")
+    # ── Header Banner ────────────────────────────────
+    print(f"\033[38;2;137;180;250m{sep}\033[0m")
+    print(f" \033[1;37m🎮  {title}\033[0m")
+    print(f"\033[38;2;137;180;250m{sep}\033[0m")
 
+    # Status line
     if is_shortcut:
-        print(f"\033[1;36m│\033[0m \033[1mStatus:\033[0m   \033[1;35m● Non-Steam Shortcut\033[0m")
-        if sc and sc.get("detected_appid"):
-            print(f"\033[1;36m│\033[0m \033[1mNative:\033[0m   \033[1;32mAppID {sc['detected_appid']}\033[0m \033[2m({(sc.get('appid_origin') or '')[:20]})\033[0m")
-        if sc and sc.get("exe"):
-            print(f"\033[1;36m│\033[0m \033[1mBinary:\033[0m   \033[2m{sc['exe'][:37]}\033[0m")
-        if sc and sc.get("shortcut_id"):
-            print(f"\033[1;36m│\033[0m \033[1mID64:\033[0m     \033[2m{sc['shortcut_id']}\033[0m")
-        print(f"\033[1;36m├──────────────────────────────────────────────────┤\033[0m")
-        print(f"\033[1;36m│\033[0m \033[1;32mAction: Press <ENTER> to launch shortcut\033[0m")
+        status_line = "\033[38;2;203;166;247m◆ Non-Steam Shortcut\033[0m"
     elif is_installed:
         app_meta = installed[str(appid)]
         sf = app_meta.get("state_flags", 4)
         if sf & 1024:
             b_dl = app_meta.get("bytes_downloaded", 0)
             b_to = app_meta.get("bytes_to_download", 0)
-            status_line = f"\033[1;36m◐ Updating in background ({format_size(b_dl)} / {format_size(b_to)})\033[0m"
+            status_line = f"\033[38;2;137;220;235m◐ Updating in background\033[0m \033[2m({format_size(b_dl)} / {format_size(b_to)})\033[0m"
         elif sf & 2:
             b_to = app_meta.get("bytes_to_download", 0)
-            status_line = f"\033[1;33m▲ Update Required ({format_size(b_to)} pending)\033[0m"
+            status_line = f"\033[38;2;250;179;135m▲ Update Required\033[0m \033[2m({format_size(b_to)} pending)\033[0m"
         else:
-            status_line = f"\033[1;32m● Installed (Ready to play)\033[0m"
-        print(f"\033[1;36m│\033[0m \033[1mStatus:\033[0m   {status_line}")
+            status_line = "\033[38;2;166;227;161m● Ready to Play\033[0m"
+    else:
+        status_line = "\033[38;2;108;112;134m○ Available in Library\033[0m"
 
+    print(f"  \033[1mStatus:\033[0m    {status_line}")
+
+    compat = get_compat_tool(appid)
+    print(f"  \033[1mRuntime:\033[0m   \033[38;2;203;166;247m{compat}\033[0m")
+
+    if is_shortcut:
+        if sc and sc.get("detected_appid"):
+            print(f"  \033[1mNative:\033[0m    \033[38;2;166;227;161mAppID {sc['detected_appid']}\033[0m \033[2m({(sc.get('appid_origin') or '')[:32]})\033[0m")
+        if sc and sc.get("exe"):
+            print(f"  \033[1mBinary:\033[0m    \033[2m{sc['exe']}\033[0m")
+        if sc and sc.get("startdir"):
+            print(f"  \033[1mFolder:\033[0m    \033[2m{sc['startdir']}\033[0m")
+        print(f"  \033[1mAppID:\033[0m     \033[38;2;249;226;175m{appid}\033[0m \033[2m(Shortcut ID: {sc.get('shortcut_id', 'N/A')})\033[0m")
+    elif is_installed:
+        app_meta = installed[str(appid)]
         if app_meta.get("size"):
-            print(f"\033[1;36m│\033[0m \033[1mSize:\033[0m     {format_size(app_meta['size'])}")
+            drive_str = f" \033[2m({app_meta['library']})\033[0m" if app_meta.get("library") else ""
+            print(f"  \033[1mStorage:\033[0m   \033[38;2;249;226;175m{format_size(app_meta['size'])}\033[0m{drive_str}")
+
+        cloud = get_cloud_save_status(appid)
+        print(f"  \033[1mCloud:\033[0m     \033[38;2;148;226;213m{cloud}\033[0m")
+
         if app_meta.get("last_played"):
             dt = datetime.fromtimestamp(app_meta["last_played"])
-            print(f"\033[1;36m│\033[0m \033[1mPlayed:\033[0m   {dt.strftime('%Y-%m-%d %H:%M')}")
+            print(f"  \033[1mPlayed:\033[0m    \033[38;2;137;220;235m{dt.strftime('%Y-%m-%d %H:%M')}\033[0m")
 
-        cloud = get_cloud_save_status(appid)
-        print(f"\033[1;36m│\033[0m \033[1mCloud:\033[0m    \033[2m{cloud[:37]}\033[0m")
-
-        if app_meta.get("library"):
-            print(f"\033[1;36m│\033[0m \033[1mDrive:\033[0m    {app_meta['library']}")
-        print(f"\033[1;36m├──────────────────────────────────────────────────┤\033[0m")
-        if sf & (2 | 1024):
-            print(f"\033[1;36m│\033[0m \033[1;33mAction: Press <ENTER> to track update in terminal\033[0m")
-        else:
-            print(f"\033[1;36m│\033[0m \033[1;32mAction: Press <ENTER> to launch game\033[0m")
-        print(f"\033[1;36m│\033[0m \033[1;31mAction: Press <Ctrl-X> to uninstall game\033[0m")
+        print(f"  \033[1mAppID:\033[0m     \033[38;2;249;226;175m{appid}\033[0m")
     else:
-        print(f"\033[1;36m│\033[0m \033[1mStatus:\033[0m   \033[1;34m○ Uninstalled (Available in library)\033[0m")
         cloud = get_cloud_save_status(appid)
-        print(f"\033[1;36m│\033[0m \033[1mCloud:\033[0m    \033[2m{cloud[:37]}\033[0m")
-        print(f"\033[1;36m├──────────────────────────────────────────────────┤\033[0m")
-        print(f"\033[1;36m│\033[0m \033[1;36mAction: Press <ENTER> to install in terminal\033[0m")
+        print(f"  \033[1mCloud:\033[0m     \033[38;2;148;226;213m{cloud}\033[0m")
+        print(f"  \033[1mAppID:\033[0m     \033[38;2;249;226;175m{appid}\033[0m")
 
-    mode_str = "\033[1;33mOFFLINE\033[0m" if is_offline_mode() else "\033[1;32mONLINE\033[0m"
-    print(f"\033[1;36m│\033[0m \033[1mSteam Mode:\033[0m {mode_str} \033[2m(<Ctrl-T> to toggle)\033[0m")
-    print(f"\033[1;36m│\033[0m \033[2mHotkeys: <Ctrl-T> Mode │ <Ctrl-O> Opts │ <Ctrl-P> Proton │ <Ctrl-F> Files\033[0m")
-    print(f"\033[1;36m╰──────────────────────────────────────────────────╯\033[0m")
+    mode_str = "\033[38;2;250;179;135mOFFLINE\033[0m" if is_offline_mode() else "\033[38;2;166;227;161mONLINE\033[0m"
+    print(f"  \033[1mNetwork:\033[0m   {mode_str}")
+
+    # ── Action & Keybind Footer ──────────────────────
+    print(f"\033[38;2;137;180;250m{sep}\033[0m")
+    if is_installed:
+        if sf & (2 | 1024):
+            act_txt = "\033[38;2;250;179;135m↵ Update\033[0m"
+        else:
+            act_txt = "\033[38;2;166;227;161m↵ Launch\033[0m"
+        print(f"  {act_txt}  │  \033[38;2;137;180;250m^F\033[0m Files & Saves  │  \033[38;2;203;166;247m^O\033[0m Options  │  \033[38;2;249;226;175m^P\033[0m Proton")
+        print(f"  \033[38;2;243;139;168m^X\033[0m Uninstall  │  \033[38;2;148;226;213m^T\033[0m Mode  │  \033[38;2;137;180;250m^S\033[0m Steam Client  │  \033[38;2;203;166;247m^Z\033[0m 0MB Shim")
+    elif is_shortcut:
+        print(f"  \033[38;2;166;227;161m↵ Launch Shortcut\033[0m  │  \033[38;2;137;180;250m^F\033[0m Files  │  \033[38;2;203;166;247m^O\033[0m Options  │  \033[38;2;249;226;175m^P\033[0m Proton")
+        print(f"  \033[38;2;148;226;213m^T\033[0m Mode  │  \033[38;2;137;180;250m^S\033[0m Steam Client  │  \033[38;2;203;166;247m^Z\033[0m 0MB Shim")
+    else:
+        print(f"  \033[38;2;137;220;235m↵ Install Game\033[0m  │  \033[38;2;148;226;213m^T\033[0m Mode  │  \033[38;2;137;180;250m^S\033[0m Steam Client")
+    print(f"\033[38;2;137;180;250m{sep}\033[0m")
 
 def launch_app(appid, shortcut_id=None):
     """Launch an installed application or non-Steam shortcut silently."""

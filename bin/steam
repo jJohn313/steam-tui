@@ -82,13 +82,13 @@ while true; do
     fi
 
     if "$BACKEND" --is-offline >/dev/null 2>&1; then
-        BORDER_LABEL=" 🎮 STEAM HEADLESS TUI [OFFLINE] "
+        BORDER_LABEL=" 🎮 STEAM LIBRARY [OFFLINE] "
         BORDER_COLOR="border:#fab387,label:#fab387"
-        HEADER_TXT="ENTER: Launch │ Ctrl-T: Mode (OFFLINE) │ Ctrl-F: Files │ Ctrl-O: Opts │ Ctrl-P: Proton │ Ctrl-S: Steam │ Ctrl-Z: Shim"
+        HEADER_TXT=" ↵ Launch │ ^T Mode (OFFLINE) │ ^F Files │ ^O Opts │ ^P Proton │ ^S Steam GUI │ ^Z Shim "
     else
-        BORDER_LABEL=" 🎮 STEAM HEADLESS TUI [ONLINE] "
-        BORDER_COLOR="border:#89b4fa,label:#89b4fa"
-        HEADER_TXT="ENTER: Launch │ Ctrl-T: Mode (ONLINE) │ Ctrl-F: Files │ Ctrl-O: Opts │ Ctrl-P: Proton │ Ctrl-S: Steam │ Ctrl-Z: Shim"
+        BORDER_LABEL=" 🎮 STEAM LIBRARY [ONLINE] "
+        BORDER_COLOR="border:#b4befe,label:#cba6f7"
+        HEADER_TXT=" ↵ Launch │ ^T Mode (ONLINE) │ ^F Files │ ^O Opts │ ^P Proton │ ^S Steam GUI │ ^Z Shim "
     fi
 
     # Run fzf with Kitty-optimized styling and preview pane
@@ -102,12 +102,13 @@ while true; do
         --border-label="$BORDER_LABEL" \
         --border-label-pos=3 \
         --info=inline-right \
-        --prompt=" Search ❯ " \
-        --pointer="▶" \
-        --color="bg+:#1e1e2e,fg+:#cdd6f4,hl:#f38ba8,hl+:#f38ba8,$BORDER_COLOR,prompt:#cba6f7,pointer:#f5e0dc,header:#6c7086" \
+        --prompt=" 🔍 " \
+        --pointer=" ❯ " \
+        --marker=" ✔ " \
+        --color="bg+:#1e1e2e,fg+:#cdd6f4,hl:#f38ba8,hl+:#f38ba8,$BORDER_COLOR,prompt:#cba6f7,pointer:#f5e0dc,header:#6c7086,info:#a6adc8" \
         --header="$HEADER_TXT" \
         --preview="$BACKEND --preview {2} {3}" \
-        --preview-window="right:48%:border-left:wrap" \
+        --preview-window="right:52%:border-left:wrap" \
         --bind="ctrl-r:reload($BACKEND --sync >/dev/null 2>&1 && $BACKEND --list)" \
         --bind="ctrl-i:reload($BACKEND --list | grep -E 'INSTALLED|UPDATE|SHORTCUT')" \
         --bind="ctrl-a:reload($BACKEND --list)" \
@@ -132,7 +133,10 @@ while true; do
     APPID=$(echo "$SELECTED" | awk -F'\t' '{print $2}' | tr -d '\r\n')
     STATUS=$(echo "$SELECTED" | awk -F'\t' '{print $3}' | tr -d '\r\n')
     SHORTCUT_ID=$(echo "$SELECTED" | awk -F'\t' '{print $4}' | tr -d '\r\n')
-    NAME=$(echo "$SELECTED" | awk -F'\t' '{print $1}' | sed -E 's/\x1b\[[0-9;]*m//g' | sed 's/^\[.*\] *//')
+    NAME=$(echo "$SELECTED" | awk -F'\t' '{print $5}' | tr -d '\r\n')
+    if [[ -z "$NAME" ]]; then
+        NAME=$(echo "$SELECTED" | awk -F'\t' '{print $1}' | sed -E 's/\x1b\[[0-9;]*m//g' | sed -E 's/^[^a-zA-Z0-9]+[a-zA-Z]+ +//')
+    fi
 
     if [[ "$STATUS" == "SHORTCUT" ]]; then
         "$BACKEND" --launch-and-monitor "$APPID" "$SHORTCUT_ID"
