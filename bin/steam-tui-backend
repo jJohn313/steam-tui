@@ -18,6 +18,7 @@ import socket
 import signal
 import time
 import shlex
+import unicodedata
 from datetime import datetime
 
 STEAM_ROOT = os.path.expanduser("~/.local/share/Steam")
@@ -2063,13 +2064,13 @@ def list_games():
     for app in installed_sorted:
         sf = app.get("state_flags", 4)
         if sf & 1024:
-            display_label = f"\033[38;2;137;220;235m◐ Updating\033[0m    {app['name']}"
+            display_label = f" \033[38;2;137;220;235m◐ Updating\033[0m   \033[1;37m{app['name']}\033[0m"
             output_lines.append(f"{display_label}\t{app['appid']}\tUPDATING\t\t{app['name']}")
         elif sf & 2:
-            display_label = f"\033[38;2;250;179;135m▲ Update\033[0m      {app['name']}"
+            display_label = f" \033[38;2;250;179;135m▲ Update\033[0m     \033[1;37m{app['name']}\033[0m"
             output_lines.append(f"{display_label}\t{app['appid']}\tUPDATE_REQUIRED\t\t{app['name']}")
         else:
-            display_label = f"\033[38;2;166;227;161m● Ready\033[0m       {app['name']}"
+            display_label = f" \033[38;2;166;227;161m● Ready\033[0m      \033[1;37m{app['name']}\033[0m"
             output_lines.append(f"{display_label}\t{app['appid']}\tINSTALLED\t\t{app['name']}")
 
     # 2. Non-Steam Shortcuts
@@ -2084,7 +2085,7 @@ def list_games():
         if sc_aid in seen_sc:
             continue
         seen_sc.add(sc_aid)
-        display_label = f"\033[38;2;203;166;247m◆ Shortcut\033[0m    {sc['name']}"
+        display_label = f" \033[38;2;203;166;247m◆ Shortcut\033[0m   \033[1;38;2;205;214;244m{sc['name']}\033[0m"
         output_lines.append(f"{display_label}\t{sc['appid']}\tSHORTCUT\t{sc['shortcut_id']}\t{sc['name']}")
 
     # 3. Available (Uninstalled Owned) games
@@ -2101,7 +2102,7 @@ def list_games():
         key=lambda x: x["name"].lower()
     )
     for app in available_sorted:
-        display_label = f"\033[38;2;108;112;134m○ Library\033[0m     \033[38;2;147;153;178m{app['name']}\033[0m"
+        display_label = f" \033[38;2;108;112;134m○ Library\033[0m    \033[38;2;147;153;178m{app['name']}\033[0m"
         output_lines.append(f"{display_label}\t{app['appid']}\tAVAILABLE\t\t{app['name']}")
 
     return "\n".join(output_lines)
@@ -2392,6 +2393,70 @@ def find_manifest_across_libraries(appid):
             return candidate
     return None
 
+def display_width(text):
+    """Calculate terminal cell display width, correctly handling emojis and ANSI codes."""
+    clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+    w = 0
+    for ch in clean:
+        w += 2 if unicodedata.east_asian_width(ch) in ('F', 'W') else 1
+    return w
+
+def truncate_str(text, max_w):
+    """Truncate text to max display cells, appending ellipsis if needed."""
+    if display_width(text) <= max_w:
+        return text
+    res = ""
+    for ch in text:
+        if display_width(res + ch + "…") > max_w:
+            break
+        res += ch
+    return res + "…"
+
+def make_box_row(content, width):
+    BC = "\033[38;2;180;190;254m"
+    RST = "\033[0m"
+    w_content = display_width(content)
+    pad = max(0, width - 6 - w_content)
+    return f"{BC}│{RST}  {content}" + (" " * pad) + f"  {BC}│{RST}"
+
+def make_box_split(left, right, width):
+    BC = "\033[38;2;180;190;254m"
+    RST = "\033[0m"
+    w_right = display_width(right)
+    max_l = max(10, width - 8 - w_right)
+    truncated_left = truncate_str(left, max_l)
+    w_left = display_width(truncated_left)
+    pad = max(1, width - 6 - w_left - w_right)
+    return f"{BC}│{RST}  {truncated_left}" + (" " * pad) + f"{right}  {BC}│{RST}"
+
+def make_kv_row(k1, v1, k2=None, v2=None, width=70):
+    BC = "\033[38;2;180;190;254m"
+    RST = "\033[0m"
+    BOLD = "\033[1m"
+    col1_w = int((width - 6) * 0.52)
+    col2_w = (width - 6) - col1_w
+
+    left_str = f"{BOLD}{k1:<9}{RST} {v1}"
+    w_left = display_width(left_str)
+    if w_left > col1_w - 1:
+        left_str = truncate_str(left_str, col1_w - 1)
+        w_left = display_width(left_str)
+    pad_l = max(1, col1_w - w_left)
+    col1 = left_str + (" " * pad_l)
+
+    if k2 is not None and v2 is not None:
+        right_str = f"{BOLD}{k2:<8}{RST} {v2}"
+        w_right = display_width(right_str)
+        if w_right > col2_w:
+            right_str = truncate_str(right_str, col2_w)
+            w_right = display_width(right_str)
+        pad_r = max(0, col2_w - w_right)
+        col2 = right_str + (" " * pad_r)
+    else:
+        col2 = " " * col2_w
+
+    return f"{BC}│{RST}  {col1}{col2}  {BC}│{RST}"
+
 def show_preview(appid, status=None):
     """Display clean Kitty-formatted metadata and pixel-perfect thumbnail."""
     config = load_config()
@@ -2413,14 +2478,28 @@ def show_preview(appid, status=None):
         else:
             title = f"Steam App {appid}"
 
+    # Determine preview column & line dimensions from fzf
+    try:
+        p_cols = int(os.environ.get("FZF_PREVIEW_COLUMNS", "72"))
+        p_lines = int(os.environ.get("FZF_PREVIEW_LINES", "40"))
+    except Exception:
+        p_cols, p_lines = 72, 40
+
+    card_w = max(52, min(p_cols - 4, 86))
+
     # Artwork resolution & caching
     chosen_img = None
     if config.get("ENABLE_IMAGE_PREVIEW", "1") == "1":
-        # 1. Local librarycache glob (handles newer client hash subdirectories)
+        # 1. Local librarycache glob (prioritize hero landscape backdrop, then header logo, then poster)
         libcache_matches = glob.glob(
-            os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "**", "*header*.jpg"),
+            os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "**", "*hero*.jpg"),
             recursive=True
         )
+        if not libcache_matches:
+            libcache_matches = glob.glob(
+                os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "**", "*header*.jpg"),
+                recursive=True
+            )
         if not libcache_matches:
             libcache_matches = glob.glob(
                 os.path.join(STEAM_ROOT, "appcache", "librarycache", str(appid), "**", "*library_600x900*.jpg"),
@@ -2459,117 +2538,110 @@ def show_preview(appid, status=None):
             except Exception:
                 pass
 
-        # Clear previous Kitty graphic in preview pane
+        # Clear previous Kitty graphics
         sys.stdout.write("\033_Ga=d,d=A\033\\")
         sys.stdout.flush()
 
-        try:
-            p_cols = int(os.environ.get("FZF_PREVIEW_COLUMNS", "54"))
-        except Exception:
-            p_cols = 54
-        card_w = max(42, min(p_cols - 2, 84))
-
-        if chosen_img and os.path.isfile(chosen_img):
+        chafa_size_cfg = str(config.get("CHAFA_SIZE", "auto")).strip()
+        if chafa_size_cfg and chafa_size_cfg != "auto" and "x" in chafa_size_cfg:
+            try:
+                img_w, img_h = map(int, chafa_size_cfg.split("x"))
+            except Exception:
+                img_w, img_h = card_w, max(8, min(16, int(card_w * 0.36)))
+        else:
             img_w = card_w
-            img_h = max(8, min(14, int(img_w * 0.34)))
-            size_arg = config.get("CHAFA_SIZE", f"{img_w}x{img_h}")
-            if shutil.which("chafa"):
-                subprocess.run(
-                    ["chafa", "-f", "kitty", "--passthrough=none", f"--size={size_arg}", chosen_img],
-                    check=False
-                )
-                print()
-            elif shutil.which("kitten"):
-                subprocess.run([
-                    "kitten", "icat",
-                    "--clear",
-                    "--transfer-mode=memory",
-                    "--stdin=no",
-                    chosen_img
-                ], check=False)
-                print()
+            img_h = max(8, min(16, int(card_w * 0.36)))
 
-    # Dynamic Card Formatting
-    try:
-        p_cols = int(os.environ.get("FZF_PREVIEW_COLUMNS", "54"))
-    except Exception:
-        p_cols = 54
-    card_w = max(42, min(p_cols - 2, 84))
-    sep = "─" * card_w
+        if chosen_img and os.path.isfile(chosen_img) and shutil.which("chafa"):
+            p_chafa = subprocess.run(
+                ["chafa", "-f", "kitty", "--passthrough=none", f"--size={img_w}x{img_h}", chosen_img],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+            if p_chafa.stdout:
+                sys.stdout.buffer.write(p_chafa.stdout)
+                match = re.search(rb'r=(\d+)', p_chafa.stdout)
+                allocated_rows = int(match.group(1)) if match else img_h
+                sys.stdout.write("\n" * (allocated_rows + 1))
+                sys.stdout.flush()
 
-    # ── Header Banner ────────────────────────────────
-    print(f"\033[38;2;137;180;250m{sep}\033[0m")
-    print(f" \033[1;37m🎮  {title}\033[0m")
-    print(f"\033[38;2;137;180;250m{sep}\033[0m")
+    # Box Border Characters in Catppuccin Lavender
+    BC = "\033[38;2;180;190;254m"
+    RST = "\033[0m"
+    sep_top = f"{BC}╭{'─' * (card_w - 2)}╮{RST}"
+    sep_mid = f"{BC}├{'─' * (card_w - 2)}┤{RST}"
+    sep_bot = f"{BC}╰{'─' * (card_w - 2)}╯{RST}"
 
-    # Status line
+    # Status badge
     if is_shortcut:
-        status_line = "\033[38;2;203;166;247m◆ Non-Steam Shortcut\033[0m"
+        status_badge = "\033[38;2;203;166;247m◆ Non-Steam Game\033[0m"
     elif is_installed:
         app_meta = installed[str(appid)]
         sf = app_meta.get("state_flags", 4)
         if sf & 1024:
             b_dl = app_meta.get("bytes_downloaded", 0)
             b_to = app_meta.get("bytes_to_download", 0)
-            status_line = f"\033[38;2;137;220;235m◐ Updating in background\033[0m \033[2m({format_size(b_dl)} / {format_size(b_to)})\033[0m"
+            status_badge = f"\033[38;2;137;220;235m◐ Updating ({format_size(b_dl)}/{format_size(b_to)})\033[0m"
         elif sf & 2:
             b_to = app_meta.get("bytes_to_download", 0)
-            status_line = f"\033[38;2;250;179;135m▲ Update Required\033[0m \033[2m({format_size(b_to)} pending)\033[0m"
+            status_badge = f"\033[38;2;250;179;135m▲ Update ({format_size(b_to)})\033[0m"
         else:
-            status_line = "\033[38;2;166;227;161m● Ready to Play\033[0m"
+            status_badge = "\033[38;2;166;227;161m● Ready to Play\033[0m"
     else:
-        status_line = "\033[38;2;108;112;134m○ Available in Library\033[0m"
+        status_badge = "\033[38;2;108;112;134m○ Available in Library\033[0m"
 
-    print(f"  \033[1mStatus:\033[0m    {status_line}")
+    print(sep_top)
+    print(make_box_split(f"🎮 \033[1;37m{title}\033[0m", status_badge, card_w))
+    print(sep_mid)
 
     compat = get_compat_tool(appid)
-    print(f"  \033[1mRuntime:\033[0m   \033[38;2;203;166;247m{compat}\033[0m")
+    mode_str = "\033[38;2;250;179;135mOFFLINE\033[0m" if is_offline_mode() else "\033[38;2;166;227;161mONLINE\033[0m"
 
     if is_shortcut:
-        if sc and sc.get("detected_appid"):
-            print(f"  \033[1mNative:\033[0m    \033[38;2;166;227;161mAppID {sc['detected_appid']}\033[0m \033[2m({(sc.get('appid_origin') or '')[:32]})\033[0m")
+        det_aid = sc.get("detected_appid") if sc else None
+        native_val = f"\033[38;2;166;227;161mAppID {det_aid}\033[0m" if det_aid else "\033[2mNot Detected\033[0m"
+        emu_val = (sc.get("appid_origin") or "Goldberg")[:16] if sc else "Custom"
+        sc_id_str = str(sc.get("shortcut_id", "N/A"))[:12] if sc else "N/A"
+
+        print(make_kv_row("Runtime:", f"\033[38;2;203;166;247m{compat}\033[0m", "Native:", native_val, card_w))
+        print(make_kv_row("Shortcut:", sc_id_str, "Origin:", emu_val, card_w))
+        print(make_box_row("\033[1mGamepad:\033[0m  \033[38;2;166;227;161mPS5 / Xbox DualSense Controller Synced\033[0m", card_w))
         if sc and sc.get("exe"):
-            print(f"  \033[1mBinary:\033[0m    \033[2m{sc['exe']}\033[0m")
-        if sc and sc.get("startdir"):
-            print(f"  \033[1mFolder:\033[0m    \033[2m{sc['startdir']}\033[0m")
-        print(f"  \033[1mAppID:\033[0m     \033[38;2;249;226;175m{appid}\033[0m \033[2m(Shortcut ID: {sc.get('shortcut_id', 'N/A')})\033[0m")
+            max_bin_w = card_w - 18
+            bin_disp = truncate_str(sc["exe"], max_bin_w)
+            print(make_box_row(f"\033[1mBinary:\033[0m   \033[2m{bin_disp}\033[0m", card_w))
     elif is_installed:
         app_meta = installed[str(appid)]
-        if app_meta.get("size"):
-            drive_str = f" \033[2m({app_meta['library']})\033[0m" if app_meta.get("library") else ""
-            print(f"  \033[1mStorage:\033[0m   \033[38;2;249;226;175m{format_size(app_meta['size'])}\033[0m{drive_str}")
-
+        size_str = format_size(app_meta.get("size", 0))
+        lib_name = os.path.basename(app_meta.get("library", "Default"))
         cloud = get_cloud_save_status(appid)
-        print(f"  \033[1mCloud:\033[0m     \033[38;2;148;226;213m{cloud}\033[0m")
-
+        played_str = "Never"
         if app_meta.get("last_played"):
             dt = datetime.fromtimestamp(app_meta["last_played"])
-            print(f"  \033[1mPlayed:\033[0m    \033[38;2;137;220;235m{dt.strftime('%Y-%m-%d %H:%M')}\033[0m")
+            played_str = dt.strftime("%Y-%m-%d %H:%M")
 
-        print(f"  \033[1mAppID:\033[0m     \033[38;2;249;226;175m{appid}\033[0m")
+        print(make_kv_row("Runtime:", f"\033[38;2;203;166;247m{compat}\033[0m", "AppID:", str(appid), card_w))
+        print(make_kv_row("Storage:", f"\033[38;2;249;226;175m{size_str}\033[0m", "Cloud:", f"\033[38;2;148;226;213m{cloud}\033[0m", card_w))
+        print(make_kv_row("Drive:", lib_name[:16], "Played:", played_str, card_w))
+        print(make_kv_row("Network:", mode_str, "Engine:", "Steam Native", card_w))
     else:
         cloud = get_cloud_save_status(appid)
-        print(f"  \033[1mCloud:\033[0m     \033[38;2;148;226;213m{cloud}\033[0m")
-        print(f"  \033[1mAppID:\033[0m     \033[38;2;249;226;175m{appid}\033[0m")
+        print(make_kv_row("Runtime:", f"\033[38;2;203;166;247m{compat}\033[0m", "AppID:", str(appid), card_w))
+        print(make_kv_row("Cloud:", f"\033[38;2;148;226;213m{cloud}\033[0m", "Network:", mode_str, card_w))
 
-    mode_str = "\033[38;2;250;179;135mOFFLINE\033[0m" if is_offline_mode() else "\033[38;2;166;227;161mONLINE\033[0m"
-    print(f"  \033[1mNetwork:\033[0m   {mode_str}")
-
-    # ── Action & Keybind Footer ──────────────────────
-    print(f"\033[38;2;137;180;250m{sep}\033[0m")
+    # Action footer
+    print(sep_mid)
     if is_installed:
-        if sf & (2 | 1024):
-            act_txt = "\033[38;2;250;179;135m↵ Update\033[0m"
-        else:
-            act_txt = "\033[38;2;166;227;161m↵ Launch\033[0m"
-        print(f"  {act_txt}  │  \033[38;2;137;180;250m^F\033[0m Files & Saves  │  \033[38;2;203;166;247m^O\033[0m Options  │  \033[38;2;249;226;175m^P\033[0m Proton")
-        print(f"  \033[38;2;243;139;168m^X\033[0m Uninstall  │  \033[38;2;148;226;213m^T\033[0m Mode  │  \033[38;2;137;180;250m^S\033[0m Steam Client  │  \033[38;2;203;166;247m^Z\033[0m 0MB Shim")
+        sf = installed[str(appid)].get("state_flags", 4)
+        act_key = "\033[1;38;2;250;179;135m↵\033[0m Update" if sf & (2 | 1024) else "\033[1;38;2;166;227;161m↵\033[0m Launch"
+        print(make_box_row(f"{act_key}    \033[1;38;2;249;226;175m^F\033[0m Files & Saves   \033[1;38;2;249;226;175m^O\033[0m Options   \033[1;38;2;249;226;175m^P\033[0m Proton", card_w))
+        print(make_box_row("\033[1;38;2;249;226;175m^T\033[0m Offline   \033[1;38;2;249;226;175m^S\033[0m Steam Client   \033[1;38;2;249;226;175m^X\033[0m Uninstall \033[1;38;2;249;226;175m^Z\033[0m 0MB Shim", card_w))
     elif is_shortcut:
-        print(f"  \033[38;2;166;227;161m↵ Launch Shortcut\033[0m  │  \033[38;2;137;180;250m^F\033[0m Files  │  \033[38;2;203;166;247m^O\033[0m Options  │  \033[38;2;249;226;175m^P\033[0m Proton")
-        print(f"  \033[38;2;148;226;213m^T\033[0m Mode  │  \033[38;2;137;180;250m^S\033[0m Steam Client  │  \033[38;2;203;166;247m^Z\033[0m 0MB Shim")
+        print(make_box_row("\033[1;38;2;166;227;161m↵\033[0m Launch    \033[1;38;2;249;226;175m^F\033[0m Files & Saves   \033[1;38;2;249;226;175m^O\033[0m Options   \033[1;38;2;249;226;175m^P\033[0m Proton", card_w))
+        print(make_box_row("\033[1;38;2;249;226;175m^T\033[0m Offline   \033[1;38;2;249;226;175m^S\033[0m Steam Client   \033[1;38;2;249;226;175m^X\033[0m Remove    \033[1;38;2;249;226;175m^Z\033[0m 0MB Shim", card_w))
     else:
-        print(f"  \033[38;2;137;220;235m↵ Install Game\033[0m  │  \033[38;2;148;226;213m^T\033[0m Mode  │  \033[38;2;137;180;250m^S\033[0m Steam Client")
-    print(f"\033[38;2;137;180;250m{sep}\033[0m")
+        print(make_box_row("\033[1;38;2;137;220;235m↵\033[0m Install   \033[1;38;2;249;226;175m^T\033[0m Offline Mode    \033[1;38;2;249;226;175m^S\033[0m Steam Client", card_w))
+    print(sep_bot)
 
 def launch_app(appid, shortcut_id=None):
     """Launch an installed application or non-Steam shortcut silently."""

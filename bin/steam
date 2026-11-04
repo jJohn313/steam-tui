@@ -84,11 +84,11 @@ while true; do
     if "$BACKEND" --is-offline >/dev/null 2>&1; then
         BORDER_LABEL=" 🎮 STEAM LIBRARY [OFFLINE] "
         BORDER_COLOR="border:#fab387,label:#fab387"
-        HEADER_TXT=" ↵ Launch │ ^T Mode (OFFLINE) │ ^F Files │ ^O Opts │ ^P Proton │ ^S Steam GUI │ ^Z Shim "
+        HEADER_TXT=" ↵ Launch  │  ^F Files & Saves  │  ^O Options  │  ^P Proton  │  ^T Mode (OFFLINE)  │  ^S Steam GUI  │  ^Z 0MB Shim "
     else
         BORDER_LABEL=" 🎮 STEAM LIBRARY [ONLINE] "
         BORDER_COLOR="border:#b4befe,label:#cba6f7"
-        HEADER_TXT=" ↵ Launch │ ^T Mode (ONLINE) │ ^F Files │ ^O Opts │ ^P Proton │ ^S Steam GUI │ ^Z Shim "
+        HEADER_TXT=" ↵ Launch  │  ^F Files & Saves  │  ^O Options  │  ^P Proton  │  ^T Mode (ONLINE)  │  ^S Steam GUI  │  ^Z 0MB Shim "
     fi
 
     # Run fzf with Kitty-optimized styling and preview pane
@@ -108,15 +108,15 @@ while true; do
         --color="bg+:#1e1e2e,fg+:#cdd6f4,hl:#f38ba8,hl+:#f38ba8,$BORDER_COLOR,prompt:#cba6f7,pointer:#f5e0dc,header:#6c7086,info:#a6adc8" \
         --header="$HEADER_TXT" \
         --preview="$BACKEND --preview {2} {3}" \
-        --preview-window="right:52%:border-left:wrap" \
+        --preview-window="right:58%:border-left:nowrap" \
         --bind="ctrl-r:reload($BACKEND --sync >/dev/null 2>&1 && $BACKEND --list)" \
-        --bind="ctrl-i:reload($BACKEND --list | grep -E 'INSTALLED|UPDATE|SHORTCUT')" \
+        --bind="ctrl-i:reload($BACKEND --list | grep -E 'Ready|Update|Shortcut')" \
         --bind="ctrl-a:reload($BACKEND --list)" \
         --bind="ctrl-o:execute($BACKEND --edit-launch-options {2})+reload($BACKEND --list)" \
         --bind="ctrl-p:execute($BACKEND --set-proton {2})+reload($BACKEND --list)" \
         --bind="ctrl-f:execute($BACKEND --files-menu {2})" \
         --bind="ctrl-x:execute($BACKEND --uninstall {2})+reload($BACKEND --list)" \
-        --height=92%)
+        --height=95%)
 
     KEY_PRESSED=$(echo "$RAW_OUT" | head -n 1)
     SELECTED=$(echo "$RAW_OUT" | tail -n +2)
