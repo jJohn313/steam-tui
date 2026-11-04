@@ -34,6 +34,11 @@ elif [[ -p "$STEAM_PIPE_FILE" ]]; then
 fi
 
 # 1. Passthrough: Explicit GUI launch & file management helpers
+if [[ "$1" == "--offline" || "$1" == "-offline" ]]; then
+    export STEAM_OFFLINE_MODE=1
+    shift
+fi
+
 if [[ "$1" == "--gui" || "$1" == "-gui" ]]; then
     exec "$BACKEND" --open-gui
 elif [[ "$1" == "--files" || "$1" == "-f" ]]; then
@@ -76,21 +81,31 @@ while true; do
         exec "$REAL_STEAM"
     fi
 
+    if "$BACKEND" --is-offline >/dev/null 2>&1; then
+        BORDER_LABEL=" 🎮 STEAM HEADLESS TUI [OFFLINE] "
+        BORDER_COLOR="border:#fab387,label:#fab387"
+        HEADER_TXT="ENTER: Launch │ Ctrl-T: Mode (OFFLINE) │ Ctrl-F: Files │ Ctrl-O: Opts │ Ctrl-P: Proton │ Ctrl-S: Steam │ Ctrl-Z: Shim"
+    else
+        BORDER_LABEL=" 🎮 STEAM HEADLESS TUI [ONLINE] "
+        BORDER_COLOR="border:#89b4fa,label:#89b4fa"
+        HEADER_TXT="ENTER: Launch │ Ctrl-T: Mode (ONLINE) │ Ctrl-F: Files │ Ctrl-O: Opts │ Ctrl-P: Proton │ Ctrl-S: Steam │ Ctrl-Z: Shim"
+    fi
+
     # Run fzf with Kitty-optimized styling and preview pane
     RAW_OUT=$(echo "$GAME_LIST" | fzf \
-        --expect=ctrl-s,ctrl-z \
+        --expect=ctrl-s,ctrl-z,ctrl-t \
         --delimiter=$'\t' \
         --with-nth=1 \
         --ansi \
         --layout=reverse \
         --border=rounded \
-        --border-label=" 🎮 STEAM HEADLESS TUI " \
+        --border-label="$BORDER_LABEL" \
         --border-label-pos=3 \
         --info=inline-right \
         --prompt=" Search ❯ " \
         --pointer="▶" \
-        --color="bg+:#1e1e2e,fg+:#cdd6f4,hl:#f38ba8,hl+:#f38ba8,border:#89b4fa,label:#89b4fa,prompt:#cba6f7,pointer:#f5e0dc,header:#6c7086" \
-        --header="ENTER: Launch │ Ctrl-F: Files & Saves │ Ctrl-O: Launch Options │ Ctrl-P: Proton │ Ctrl-S: Steam │ Ctrl-Z: Shim" \
+        --color="bg+:#1e1e2e,fg+:#cdd6f4,hl:#f38ba8,hl+:#f38ba8,$BORDER_COLOR,prompt:#cba6f7,pointer:#f5e0dc,header:#6c7086" \
+        --header="$HEADER_TXT" \
         --preview="$BACKEND --preview {2} {3}" \
         --preview-window="right:48%:border-left:wrap" \
         --bind="ctrl-r:reload($BACKEND --sync >/dev/null 2>&1 && $BACKEND --list)" \
@@ -104,6 +119,11 @@ while true; do
 
     KEY_PRESSED=$(echo "$RAW_OUT" | head -n 1)
     SELECTED=$(echo "$RAW_OUT" | tail -n +2)
+
+    if [[ "$KEY_PRESSED" == "ctrl-t" ]]; then
+        "$BACKEND" --toggle-offline
+        continue
+    fi
 
     if [[ -z "$SELECTED" ]]; then
         exit 0

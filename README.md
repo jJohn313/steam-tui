@@ -21,7 +21,9 @@ Intercepts interactive terminal calls to `steam` to deliver an instantaneous, ke
 
 ### 🎮 Keyboard-Driven Terminal Power
 - **Instant FZF Launcher**: Lightning-fast fuzzy search across all libraries, secondary drives, and non-Steam shortcuts with Kitty true-color box art preview.
+- **On-Demand & Persistent Offline Mode (`Ctrl-T`)**: Toggle between `[ONLINE]` and `[OFFLINE]` with a single keystroke. When offline, Steam runs isolated with `-offline` (zero network pings, no friends status, no auto-updates, and your library remains completely free for family/friends playing via Steam Family Sharing). Can also be set permanently via `OFFLINE_MODE=1` in `config.env`.
 - **Deep Files & Save Data Hub (`Ctrl-F`)**: Browse game installation directories and pinpoint exact save file locations without opening native Steam. Seamlessly compatible with **Yazi** (`yazi-dolphin` TUI), **KDE Dolphin** (GUI), or system default (`xdg-open`).
+- **Non-Steam Native AppID & Gamepad Auto-Sync**: Automatically detects real underlying Steam AppIDs for non-Steam shortcuts (`steam_appid.txt`, Goldberg emulator, Codex/FLT/SmartSteamEmu configs) and mirrors Steam Input controller bindings across both the shortcut ID and native AppID. Eliminates controller dropouts and desktop profile fallback (`empty.vdf`) caused by AppID desyncs. Includes CLI utilities `--detect-appid` and `--sync-shortcut-appids`.
 - **Automatic Save Path Discovery**: Intelligently scans and detects game-specific save folders across Proton prefixes (`Documents/My Games`, `Saved Games`, `AppData/Local`, `AppData/Roaming`, `AppData/LocalLow`), Steam Cloud `userdata`, and native Linux locations.
 - **In-TUI Settings & Prefix Manager**: Inline launch options editor (`Ctrl-O`), Proton compatibility switcher (`Ctrl-P`), and wine runtime tools (`winecfg`, WINEPREFIX terminal).
 - **Headless Installation & EULA Bypass**: Install games across target drives via terminal without webview prompts or multi-step wizard modals.
@@ -191,6 +193,11 @@ ENABLE_LIGHTWEIGHT_SHIM=1
 # 1 = Force official Steam client globally for all launches
 # 0 = Allow intelligent anti-cheat classifier to choose the optimal engine
 FORCE_OFFICIAL_STEAM=0
+
+# Persistent Offline Mode (toggle with <Ctrl-T> in TUI)
+# 1 = Always launch Steam in Offline Mode (zero network activity, no friends status, no auto-updates)
+# 0 = Normal online mode (default)
+OFFLINE_MODE=0
 
 # Preferred file manager for opening game installation and save directories
 # Options: "auto" (default: yazi / yazi-dolphin if available, else Dolphin/xdg-open), "yazi", "dolphin", "xdg-open"

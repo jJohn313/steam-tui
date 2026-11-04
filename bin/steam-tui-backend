@@ -93,6 +93,11 @@ def cdp_send(ws_url, msg_dict):
             s.close()
             return False
         s.sendall(header + payload)
+        try:
+            s.settimeout(0.5)
+            s.recv(1024)
+        except Exception:
+            pass
         s.close()
         return True
     except Exception:
@@ -119,6 +124,7 @@ def load_config():
         "STEAM_ID64": "",
         "ENABLE_IMAGE_PREVIEW": "1",
         "CHAFA_SIZE": "42x11",
+        "OFFLINE_MODE": "0",
     }
     if os.path.isfile(CONFIG_FILE):
         try:
@@ -134,6 +140,75 @@ def load_config():
         except Exception:
             pass
     return cfg
+
+def is_offline_mode():
+    """Check if offline mode is enabled via config or environment."""
+    if os.environ.get("STEAM_OFFLINE_MODE") == "1":
+        return True
+    cfg = load_config()
+    return cfg.get("OFFLINE_MODE", "0") == "1"
+
+def set_loginusers_offline_mode(enabled: bool):
+    """Set WantsOfflineMode and SkipOfflineModeWarning in Steam's loginusers.vdf."""
+    login_vdf = os.path.join(STEAM_ROOT, "config", "loginusers.vdf")
+    if not os.path.isfile(login_vdf):
+        return False
+    try:
+        with open(login_vdf, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        val = "1" if enabled else "0"
+        if "WantsOfflineMode" in content:
+            content = re.sub(r'("WantsOfflineMode"\s+)"[0-9]+"', rf'\1"{val}"', content)
+        else:
+            content = re.sub(r'(\t+"RememberPassword"\s+"[0-9]+")', rf'\1\n\t\t"WantsOfflineMode"\t\t"{val}"', content)
+
+        if "SkipOfflineModeWarning" in content:
+            content = re.sub(r'("SkipOfflineModeWarning"\s+)"[0-9]+"', rf'\1"{val}"', content)
+        else:
+            content = re.sub(r'(\t+"WantsOfflineMode"\s+"[0-9]+")', rf'\1\n\t\t"SkipOfflineModeWarning"\t\t"{val}"', content)
+
+        with open(login_vdf, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+    except Exception as e:
+        sys.stderr.write(f"Warning: Failed to update loginusers.vdf: {e}\n")
+        return False
+
+def toggle_offline_mode():
+    """Toggle OFFLINE_MODE setting in ~/.config/steam_tui/config.env and update loginusers.vdf."""
+    current = is_offline_mode()
+    new_state = not current
+    new_val = "1" if new_state else "0"
+
+    lines = []
+    found = False
+    if os.path.isfile(CONFIG_FILE):
+        with open(CONFIG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        for idx, line in enumerate(lines):
+            if re.match(r'^\s*OFFLINE_MODE\s*=', line):
+                lines[idx] = f"OFFLINE_MODE={new_val}\n"
+                found = True
+                break
+    if not found:
+        lines.append(f"\n# Persistent Offline Mode (1 = Offline, 0 = Online)\nOFFLINE_MODE={new_val}\n")
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    set_loginusers_offline_mode(new_state)
+
+    state_str = "\033[1;33mOFFLINE\033[0m" if new_state else "\033[1;32mONLINE\033[0m"
+    print(f"\n\033[1;36m[Steam TUI]\033[0m Steam Mode toggled to: {state_str}")
+    try:
+        msg = "Steam Mode: OFFLINE (Disconnected from Steamworks, 0 network activity)" if new_state else "Steam Mode: ONLINE (Connected to Steamworks)"
+        icon = "network-offline" if new_state else "network-online"
+        subprocess.run(["notify-send", "Steam TUI", msg, "-i", icon, "-t", "2000"], check=False)
+    except Exception:
+        pass
+    return new_state
 
 def is_filtered(name, app_type="game"):
     """Filter out runtime packages, tools, soundtracks, DLCs, and non-games."""
@@ -748,6 +823,11 @@ def launch_via_shim(appid, app=None):
     if not os.path.isdir(shim_dir):
         raise ValueError(f"Shim directory does not exist: {shim_dir}")
 
+    # Controller / uinput pre-flight notice
+    uinput_ok, uinput_err = check_uinput_support()
+    if not uinput_ok:
+        sys.stderr.write(f"\n\033[1;33m[Steam TUI Controller Warning]\033[0m /dev/uinput is unavailable: {uinput_err}\n")
+
     cwd = os.path.dirname(exe_path)
     compat_data = None
     proton_bin = None
@@ -972,6 +1052,184 @@ def parse_appinfo_vdf():
 
     return apps
 
+def detect_game_appid(exe_path=None, start_dir=None):
+    """General-purpose Steam AppID detector across game installations and non-Steam folders.
+
+    Inspects game roots, binary directories, and emulator configurations:
+    1. steam_appid.txt (Valve SDK & standard emulators)
+    2. steam_settings/steam_appid.txt (Goldberg Steam Emulator)
+    3. steam_settings/configs.app.ini (Goldberg AppID / DLC metadata)
+    4. Common Steam emulator INIs: steam_emu.ini, SmartSteamEmu.ini, valve.ini, flt.ini, codex.ini, steam_api.ini, hlm.ini, gse.ini
+    5. actionManifest/steam_input_manifest.vdf (Native Steam Input manifests)
+    6. steam_interfaces.txt
+
+    Returns:
+        (detected_appid, origin_str) or (None, None)
+    """
+    candidates = []
+    for p in (exe_path, start_dir):
+        if not p:
+            continue
+        clean = p.strip("\"'")
+        if os.path.isfile(clean):
+            d = os.path.dirname(os.path.abspath(clean))
+            candidates.extend([d, os.path.dirname(d), os.path.dirname(os.path.dirname(d))])
+        elif os.path.isdir(clean):
+            d = os.path.abspath(clean)
+            candidates.extend([d, os.path.dirname(d), os.path.dirname(os.path.dirname(d))])
+
+    seen = set()
+    for c in candidates:
+        if not c or c in seen or not os.path.isdir(c):
+            continue
+        seen.add(c)
+
+        # 1. steam_appid.txt
+        txt_root = os.path.join(c, "steam_appid.txt")
+        if os.path.isfile(txt_root):
+            try:
+                with open(txt_root, "r", encoding="utf-8", errors="ignore") as f:
+                    m = re.search(r"^\s*(\d+)", f.read().strip())
+                    if m and int(m.group(1)) > 0:
+                        return m.group(1), f"steam_appid.txt ({txt_root})"
+            except Exception:
+                pass
+
+        # 2. Goldberg Steam Emulator (steam_settings/steam_appid.txt or settings/steam_appid.txt)
+        for s_dir in ("steam_settings", "settings"):
+            g_txt = os.path.join(c, s_dir, "steam_appid.txt")
+            if os.path.isfile(g_txt):
+                try:
+                    with open(g_txt, "r", encoding="utf-8", errors="ignore") as f:
+                        m = re.search(r"^\s*(\d+)", f.read().strip())
+                        if m and int(m.group(1)) > 0:
+                            return m.group(1), f"Goldberg {s_dir} ({g_txt})"
+                except Exception:
+                    pass
+
+        # 3. Goldberg configs.app.ini
+        for s_dir in ("steam_settings", "settings", ""):
+            g_ini = os.path.join(c, s_dir, "configs.app.ini") if s_dir else os.path.join(c, "configs.app.ini")
+            if os.path.isfile(g_ini):
+                try:
+                    with open(g_ini, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            m = re.search(r"^\s*(?:appid|app_id)\s*=\s*(\d+)", line, re.I)
+                            if m and int(m.group(1)) > 0:
+                                return m.group(1), f"Goldberg configs.app.ini ({g_ini})"
+                except Exception:
+                    pass
+
+        # 4. Standard emulator INIs (Codex, SmartSteamEmu, Valve, Fairlight, etc.)
+        ini_candidates = [
+            "steam_emu.ini", "SmartSteamEmu.ini", "valve.ini", "flt.ini",
+            "codex.ini", "steam_api.ini", "hlm.ini", "gse.ini"
+        ]
+        for ininame in ini_candidates:
+            ini_path = os.path.join(c, ininame)
+            if os.path.isfile(ini_path):
+                try:
+                    with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            m = re.search(r"^\s*(?:AppId|ApplicationId|GameId|SteamAppId)\s*=\s*(\d+)", line, re.I)
+                            if m and int(m.group(1)) > 0:
+                                return m.group(1), f"{ininame} ({ini_path})"
+                except Exception:
+                    pass
+
+        # 5. Steam Input action manifest (e.g. actionManifest/steam_input_manifest.vdf)
+        for m_dir in ("actionManifest", ""):
+            man_path = os.path.join(c, m_dir, "steam_input_manifest.vdf") if m_dir else os.path.join(c, "steam_input_manifest.vdf")
+            if os.path.isfile(man_path):
+                try:
+                    with open(man_path, "r", encoding="utf-8", errors="ignore") as f:
+                        m = re.search(r'\"(?:appid|app_id)\"\s*\"(\d+)\"', f.read(), re.I)
+                        if m and int(m.group(1)) > 0:
+                            return m.group(1), f"steam_input_manifest.vdf ({man_path})"
+                except Exception:
+                    pass
+
+    return None, None
+
+def sync_shortcut_controller_configs(shortcut_aid, detected_aid=None, game_dir=None):
+    """Synchronize Steam Controller configurations across shortcut IDs and detected native AppIDs.
+
+    Prevents Steam from switching active gamepad profiles or dropping to empty.vdf (Desktop Profile)
+    when a game initializes native Steamworks/Goldberg under its real AppID while launched as a shortcut.
+    """
+    if not shortcut_aid and not detected_aid:
+        return 0
+
+    appids = set()
+    if shortcut_aid:
+        appids.add(str(shortcut_aid))
+        try:
+            val = int(shortcut_aid)
+            if val > 0x7FFFFFFF:
+                appids.add(str(val - 0x100000000))
+        except Exception:
+            pass
+    if detected_aid:
+        appids.add(str(detected_aid))
+
+    if not appids:
+        return 0
+
+    templates = {
+        "ps5": "controller_ps5_gamepad_joystick.vdf",
+        "ps4": "controller_ps4_gamepad_joystick.vdf",
+        "ps3": "controller_ps3_gamepad_joystick.vdf",
+        "xbox360": "controller_xbox360_gamepad_joystick.vdf",
+        "xboxone": "controller_xboxone_gamepad_joystick.vdf",
+        "generic": "controller_generic_gamepad_joystick.vdf",
+        "switch_pro": "controller_switch_pro_gamepad_joystick.vdf",
+        "default": "controller_ps5_gamepad_joystick.vdf",
+    }
+
+    sync_count = 0
+    config_pattern = os.path.join(STEAM_ROOT, "steamapps/common/Steam Controller Configs/*/config/configset_*.vdf")
+    for vdf_path in glob.glob(config_pattern):
+        try:
+            fname = os.path.basename(vdf_path).lower()
+            tmpl = templates["default"]
+            for k, v in templates.items():
+                if k in fname:
+                    tmpl = v
+                    break
+
+            with open(vdf_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            existing_block = None
+            for aid in appids:
+                m = re.search(rf'(\"{re.escape(aid)}\"\s*\{{[^}}]*\}})', content)
+                if m:
+                    existing_block = m.group(1)
+                    break
+
+            modified = False
+            for aid in appids:
+                if not re.search(rf'\"{re.escape(aid)}\"\s*\{{[^}}]*\}}', content):
+                    if existing_block:
+                        entry = re.sub(r'^\s*\"[^\"]+\"', f'\t"{aid}"', existing_block)
+                        entry = f"{entry}\n"
+                    else:
+                        entry = f'\t"{aid}"\n\t{{\n\t\t"template"\t\t"{tmpl}"\n\t}}\n'
+
+                    idx = content.rfind("}")
+                    if idx != -1:
+                        content = content[:idx] + entry + content[idx:]
+                        modified = True
+
+            if modified:
+                with open(vdf_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                sync_count += 1
+        except Exception:
+            pass
+
+    return sync_count
+
 def get_non_steam_shortcuts():
     """Parse shortcuts.vdf across all userdata directories."""
     shortcuts = {}
@@ -1017,14 +1275,22 @@ def get_non_steam_shortcuts():
                 startdir = sc.get("StartDir", sc.get("startdir", ""))
                 opts = sc.get("LaunchOptions", sc.get("launchoptions", ""))
                 sc_id_64 = (aid << 32) | 0x02000000
-                shortcuts[str(aid)] = {
+
+                det_aid, origin = detect_game_appid(exe, startdir)
+
+                sc_data = {
                     "name": name,
                     "appid": str(aid),
                     "shortcut_id": str(sc_id_64),
                     "exe": exe,
                     "startdir": startdir,
                     "launch_options": opts,
+                    "detected_appid": det_aid,
+                    "appid_origin": origin,
                 }
+                shortcuts[str(aid)] = sc_data
+                if det_aid and str(det_aid) != str(aid):
+                    shortcuts[str(det_aid)] = sc_data
         except Exception:
             pass
     return shortcuts
@@ -1874,6 +2140,68 @@ def cleanup_stale_steam_locks():
                     except Exception:
                         pass
 
+def check_uinput_support():
+    """Verify that /dev/uinput is functional for virtual gamepad creation (Steam Input)."""
+    uinput_path = "/dev/uinput"
+    if not os.path.exists(uinput_path):
+        return False, "Device node /dev/uinput does not exist."
+    try:
+        fd = os.open(uinput_path, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        return True, ""
+    except OSError as e:
+        if e.errno == 19:  # ENODEV
+            return False, "Kernel module 'uinput' is not loaded (ENODEV: kernel package was upgraded while running; reboot required to restore)."
+        elif e.errno == 13:  # EACCES
+            return False, "Permission denied on /dev/uinput. User lacks ACL or write permissions."
+        return False, f"Cannot open /dev/uinput: {e.strerror}"
+
+def check_controller_diagnostics():
+    """Diagnostic tool to inspect controllers, SDL detection, and uinput status."""
+    print("\n\033[1;36m=== Controller & Steam Input Diagnostics ===\033[0m")
+
+    # 1. uinput check
+    ok, err = check_uinput_support()
+    if ok:
+        print("  \033[1;32m✔ /dev/uinput\033[0m: Functional (Steam Input virtual gamepad emulation ready)")
+    else:
+        print(f"  \033[1;31m✘ /dev/uinput\033[0m: \033[1;33mFAILED\033[0m ({err})")
+        print("    \033[2mImpact: Games relying on Steam Input (e.g. DualSense in XInput games) will fail to receive input.\033[0m")
+        print("    \033[2mResolution: Reboot your system to load modules matching the upgraded kernel.\033[0m")
+
+    # 2. Kernel input devices
+    print("\n\033[1;36m=== Kernel Joystick Devices (/dev/input/js*) ===\033[0m")
+    js_devs = glob.glob("/dev/input/js*")
+    if js_devs:
+        for js in sorted(js_devs):
+            try:
+                name_out = subprocess.check_output(["udevadm", "info", "-q", "property", "-n", js], stderr=subprocess.DEVNULL).decode()
+                name_match = re.search(r'ID_MODEL=(.+)', name_out)
+                model_name = name_match.group(1).replace("_", " ") if name_match else "Generic Joystick"
+                print(f"  • {js}: {model_name}")
+            except Exception:
+                print(f"  • {js}")
+    else:
+        print("  No joystick device nodes detected.")
+
+    # 3. SDL2 detection
+    print("\n\033[1;36m=== SDL2 Controller Detection ===\033[0m")
+    try:
+        import ctypes
+        sdl = ctypes.CDLL("libSDL2-2.0.so.0")
+        sdl.SDL_Init(0x00000200 | 0x00000020) # GAMECONTROLLER | JOYSTICK
+        sdl.SDL_JoystickNameForIndex.restype = ctypes.c_char_p
+        num = sdl.SDL_NumJoysticks()
+        print(f"  SDL2 detected joysticks: {num}")
+        for i in range(num):
+            jname = sdl.SDL_JoystickNameForIndex(i).decode('utf-8', 'ignore') if sdl.SDL_JoystickNameForIndex(i) else "Unknown"
+            is_gc = bool(sdl.SDL_IsGameController(i))
+            print(f"    [{i}] {jname} (GameController: {is_gc})")
+        sdl.SDL_Quit()
+    except Exception as e:
+        print(f"  Could not query SDL2: {e}")
+    print()
+
 def is_steam_healthy():
     """Verify whether the Steam daemon is alive, responsive, and has webhelper running."""
     res_steam = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL)
@@ -1899,7 +2227,7 @@ def purge_steam_daemon():
     subprocess.run(["pkill", "-9", "-f", "srt-logger"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     cleanup_stale_steam_locks()
 
-def wait_for_steam_ready(timeout=25):
+def wait_for_steam_ready(timeout=25, offline=False):
     """Wait until steam.pipe exists and Steam IPC is accepting commands."""
     import time
     pipe_file = os.path.expanduser("~/.steam/steam.pipe")
@@ -1935,29 +2263,39 @@ def wait_for_steam_ready(timeout=25):
                 pipe_detected = True
                 pipe_time = time.time()
 
-            # Check if connection_log shows "LoggedOn"
-            if os.path.isfile(conn_log):
-                try:
-                    with open(conn_log, "rb") as f:
-                        f.seek(max(0, os.path.getsize(conn_log) - 4096))
-                        tail = f.read().decode("utf-8", errors="ignore")
-                    if "LoggedOn" in tail or "LogOnResponse" in tail or "k_EMsgClientLogOnResponse" in tail:
-                        time.sleep(1.0)
-                        return True
-                except Exception:
-                    pass
+            if offline:
+                # In offline mode, Steam does not contact CM servers for LoggedOn.
+                # Once the IPC pipe has existed for 1.5 seconds, Steam IPC is ready!
+                if time.time() - pipe_time >= 1.5:
+                    return True
+            else:
+                # Check if connection_log shows "LoggedOn"
+                if os.path.isfile(conn_log):
+                    try:
+                        with open(conn_log, "rb") as f:
+                            f.seek(max(0, os.path.getsize(conn_log) - 4096))
+                            tail = f.read().decode("utf-8", errors="ignore")
+                        if "LoggedOn" in tail or "LogOnResponse" in tail or "k_EMsgClientLogOnResponse" in tail:
+                            time.sleep(1.0)
+                            return True
+                    except Exception:
+                        pass
 
-            # If pipe has existed for at least 6 seconds, assume ready
-            if time.time() - pipe_time >= 6.0:
-                return True
+                # If pipe has existed for at least 6 seconds, assume ready
+                if time.time() - pipe_time >= 6.0:
+                    return True
 
         time.sleep(0.5)
 
     return is_steam_running_and_healthy()
 
-def start_headless_daemon():
+def start_headless_daemon(force_offline=False):
     """Start Steam silently without full GUI overhead and block until IPC pipe & login are ready."""
     cleanup_stale_steam_locks()
+
+    offline = force_offline or is_offline_mode()
+    if offline:
+        set_loginusers_offline_mode(True)
 
     # Pre-flight check: If steam is running but no game is active, check for the 70MB ghost
     if subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL).returncode == 0:
@@ -1994,7 +2332,8 @@ def start_headless_daemon():
 
     res = subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL)
     if res.returncode != 0:
-        print("\033[1;34mStarting minimal Steam daemon...\033[0m")
+        mode_label = " \033[1;33m[OFFLINE MODE]\033[0m" if offline else ""
+        print(f"\033[1;34mStarting minimal Steam daemon{mode_label}...\033[0m")
         cmd = [
             REAL_STEAM,
             "-silent",
@@ -2008,14 +2347,17 @@ def start_headless_daemon():
             "-cef-enable-debugging",
             "-js-flags=--max-old-space-size=64 --lite-mode --optimize-for-size",
         ]
+        if offline:
+            cmd.insert(1, "-offline")
         subprocess.Popen(cmd, env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        sys.stdout.write("Waiting for Steam IPC & network connection...")
+        wait_msg = "Waiting for Steam IPC & offline runtime..." if offline else "Waiting for Steam IPC & network connection..."
+        sys.stdout.write(wait_msg)
         sys.stdout.flush()
-        ok = wait_for_steam_ready(timeout=25)
+        ok = wait_for_steam_ready(timeout=25, offline=offline)
         if ok:
             print(" \033[1;32m[Ready]\033[0m")
         else:
-            print(" \033[1;33m[Timeout waiting for LoggedOn, proceeding]\033[0m")
+            print(" \033[1;33m[Timeout waiting for ready, proceeding]\033[0m")
         constrain_headless_cef(in_game=False)
 
 def select_library_folder():
@@ -2147,6 +2489,8 @@ def show_preview(appid, status=None):
 
     if is_shortcut:
         print(f"\033[1;36m│\033[0m \033[1mStatus:\033[0m   \033[1;35m● Non-Steam Shortcut\033[0m")
+        if sc and sc.get("detected_appid"):
+            print(f"\033[1;36m│\033[0m \033[1mNative:\033[0m   \033[1;32mAppID {sc['detected_appid']}\033[0m \033[2m({(sc.get('appid_origin') or '')[:20]})\033[0m")
         if sc and sc.get("exe"):
             print(f"\033[1;36m│\033[0m \033[1mBinary:\033[0m   \033[2m{sc['exe'][:37]}\033[0m")
         if sc and sc.get("shortcut_id"):
@@ -2191,7 +2535,9 @@ def show_preview(appid, status=None):
         print(f"\033[1;36m├──────────────────────────────────────────────────┤\033[0m")
         print(f"\033[1;36m│\033[0m \033[1;36mAction: Press <ENTER> to install in terminal\033[0m")
 
-    print(f"\033[1;36m│\033[0m \033[2mHotkeys: <Ctrl-O> Launch Opts │ <Ctrl-P> Proton │ <Ctrl-F> Files\033[0m")
+    mode_str = "\033[1;33mOFFLINE\033[0m" if is_offline_mode() else "\033[1;32mONLINE\033[0m"
+    print(f"\033[1;36m│\033[0m \033[1mSteam Mode:\033[0m {mode_str} \033[2m(<Ctrl-T> to toggle)\033[0m")
+    print(f"\033[1;36m│\033[0m \033[2mHotkeys: <Ctrl-T> Mode │ <Ctrl-O> Opts │ <Ctrl-P> Proton │ <Ctrl-F> Files\033[0m")
     print(f"\033[1;36m╰──────────────────────────────────────────────────╯\033[0m")
 
 def launch_app(appid, shortcut_id=None):
@@ -2597,6 +2943,8 @@ def get_running_steam_game():
         installed = get_installed_games()
         shortcuts = get_non_steam_shortcuts()
         for line in reaper_out.strip().split('\n'):
+            if "Install=1" in line:
+                continue
             m = re.search(r'(\d+)\s+.*reaper SteamLaunch AppId=(\d+)', line)
             if m:
                 r_pid, r_aid = int(m.group(1)), m.group(2)
@@ -2824,8 +3172,8 @@ def show_dashboard(target_appid=None):
         if old_settings:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
-def acknowledge_steam_interstitials():
-    """Call SteamClient.Apps.ContinueGameAction on SharedJSContext via CDP to auto-pass launch dialogs."""
+def acknowledge_steam_interstitials(target_appid=None):
+    """Call SteamClient.Apps.ContinueGameAction on SharedJSContext via CDP to auto-pass launch dialogs and EULAs."""
     try:
         req = urllib.request.Request("http://127.0.0.1:8080/json", headers={"User-Agent": "steam-tui"})
         with urllib.request.urlopen(req, timeout=0.6) as resp:
@@ -2834,7 +3182,47 @@ def acknowledge_steam_interstitials():
             if "SharedJSContext" in t.get("title", "") or "SharedJSContext" in t.get("url", ""):
                 ws = t.get("webSocketDebuggerUrl")
                 if ws:
-                    js_code = "for(let i=1; i<=15; i++){ try { SteamClient.Apps.ContinueGameAction(i, ''); } catch(e){} }"
+                    target_arg = int(target_appid) if target_appid else 0
+                    js_code = f"""(async () => {{
+                        const prompts = ['ShowInterstitials', 'ShowEula', 'IgnoreInstallError', 'KickOtherSession', 'CreatingProcess', '', '0', '1'];
+                        try {{
+                            const acts = await SteamClient.Apps.GetActiveGameActions();
+                            if (acts && Array.isArray(acts)) {{
+                                for (const a of acts) {{
+                                    const id = a.nGameActionID;
+                                    const aid = a.nAppID || a.unAppID || a.appid || {target_arg};
+                                    if (aid) {{
+                                        try {{
+                                            const eulas = await SteamClient.Apps.LoadEula(aid);
+                                            if (eulas && Array.isArray(eulas)) {{
+                                                for (const eu of eulas) {{
+                                                    SteamClient.Apps.MarkEulaAccepted(aid, eu.id, eu.version);
+                                                }}
+                                            }}
+                                        }} catch(e){{}}
+                                    }}
+                                    for (const p of prompts) {{
+                                        try {{ SteamClient.Apps.ContinueGameAction(id, p); }} catch(e){{}}
+                                    }}
+                                }}
+                            }}
+                        }} catch(e){{}}
+                        if ({target_arg}) {{
+                            try {{
+                                const eulas = await SteamClient.Apps.LoadEula({target_arg});
+                                if (eulas && Array.isArray(eulas)) {{
+                                    for (const eu of eulas) {{
+                                        SteamClient.Apps.MarkEulaAccepted({target_arg}, eu.id, eu.version);
+                                    }}
+                                }}
+                            }} catch(e){{}}
+                        }}
+                        for (let i = 1; i <= 20; i++) {{
+                            for (const p of prompts) {{
+                                try {{ SteamClient.Apps.ContinueGameAction(i, p); }} catch(e){{}}
+                            }}
+                        }}
+                    }})()"""
                     cdp_send(ws, {
                         "id": 999,
                         "method": "Runtime.evaluate",
@@ -3015,10 +3403,21 @@ def constrain_headless_cef(in_game=False):
         except Exception:
             pass
 
-def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official=False):
+def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official=False, force_offline=False):
     """Launch game silently, track update/shaders if needed, and monitor session persistently."""
     import time
     cleanup_stale_steam_locks()
+
+    # Pre-flight Controller / Steam Input Health Check
+    uinput_ok, uinput_err = check_uinput_support()
+    if not uinput_ok:
+        sys.stderr.write(f"\n\033[1;33m[Steam TUI Controller Warning]\033[0m Steam Input controller emulation may fail:\n")
+        sys.stderr.write(f"  {uinput_err}\n")
+        sys.stderr.write(f"  PlayStation/Switch/Generic gamepads requiring XInput translation will not receive input.\n\n")
+        try:
+            subprocess.run(["notify-send", "Steam TUI: Controller Warning", f"Steam Input issue: {uinput_err}", "-i", "dialog-warning", "-t", "6000"], check=False)
+        except Exception:
+            pass
 
     is_shortcut = bool(shortcut_id)
     if not is_shortcut:
@@ -3028,6 +3427,9 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
             shortcut_id = shortcuts[str(appid)]["shortcut_id"]
 
     name = get_game_name(appid)
+
+    # Offline Mode Resolution
+    offline = force_offline or is_offline_mode()
 
     # Dual-Engine Dispatcher
     cfg = load_config()
@@ -3052,10 +3454,29 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
             else:
                 print(f"\n\033[1;36m[Dispatcher]\033[0m Game requires official Steam runtime ({ac_info['type']}). Routing to Valve client...")
 
+    det_aid = None
+    det_origin = None
     if is_shortcut:
-        start_headless_daemon()
+        sc = shortcuts.get(str(appid)) or {}
+        det_aid = sc.get("detected_appid")
+        if not det_aid:
+            det_aid, det_origin = detect_game_appid(sc.get("exe"), sc.get("startdir"))
+        else:
+            det_origin = sc.get("appid_origin", "game directory")
+
+        if det_aid:
+            print(f"\n\033[1;36m[Steam TUI Gamepad Sync]\033[0m Prioritizing Native Steamworks AppID \033[1;33m{det_aid}\033[0m ({det_origin})")
+            sync_shortcut_controller_configs(appid, det_aid, sc.get("startdir"))
+            os.environ["SteamAppId"] = str(det_aid)
+            os.environ["SteamGameId"] = str(det_aid)
+
+        start_headless_daemon(force_offline=offline)
         print(f"\n\033[1;36mInitializing Non-Steam Shortcut {name} (ID: {shortcut_id})...\033[0m")
-        subprocess.Popen([REAL_STEAM, "-silent", f"steam://rungameid/{shortcut_id}"], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        s_env = get_steam_env(headless=True)
+        if det_aid:
+            s_env["SteamAppId"] = str(det_aid)
+            s_env["SteamGameId"] = str(det_aid)
+        subprocess.Popen([REAL_STEAM, "-silent", f"steam://rungameid/{shortcut_id}"], env=s_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         subprocess.run(["notify-send", "Steam (Headless)", f"Launching {name}...", "-i", "steam"], check=False)
     else:
         installed = get_installed_games()
@@ -3063,7 +3484,7 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
         manifest_path = app["manifest_path"] if app else None
 
         # 1. Update check
-        if manifest_path and os.path.isfile(manifest_path):
+        if not offline and manifest_path and os.path.isfile(manifest_path):
             acf = parse_acf_file(manifest_path)
             if acf:
                 sf = acf.get("state_flags", 0)
@@ -3073,14 +3494,17 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
                     rem_bytes = to_dl - dl if to_dl > dl else to_dl
                     print(f"\n\033[1;33mGame update required for {name} ({format_size(rem_bytes)})\033[0m")
                     track_update(appid, is_new_install=False)
+        elif offline:
+            print(f"\033[1;33m[Offline Mode Active]\033[0m Bypassing game update & network sync checks.")
 
         # 2. Ensure minimal Steam daemon is running (CEF disabled)
-        start_headless_daemon()
+        start_headless_daemon(force_offline=offline)
 
         # 3. Trigger silent launch
-        print(f"\n\033[1;36mInitializing {name} (AppID: {appid})...\033[0m")
+        mode_tag = " (Offline)" if offline else ""
+        print(f"\n\033[1;36mInitializing {name}{mode_tag} (AppID: {appid})...\033[0m")
         subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        subprocess.run(["notify-send", "Steam (Headless)", f"Launching {name}...", "-i", "steam"], check=False)
+        subprocess.run(["notify-send", "Steam (Headless)", f"Launching {name}{mode_tag}...", "-i", "steam"], check=False)
 
     # 4. Wait for game runtime to attach (dynamic timeout waiting for Proton/fossilize)
     sys.stdout.write("Waiting for game runtime to attach...")
@@ -3093,7 +3517,7 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
         now = time.time()
         if now - last_action_check >= 1.5:
             last_action_check = now
-            acknowledge_steam_interstitials()
+            acknowledge_steam_interstitials(appid)
             close_unwanted_steam_windows()
 
         # Check if Steam started an update/download for this game instead of launching
@@ -3122,11 +3546,20 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
 
         game = get_running_steam_game()
         if game:
-            if game['appid'] == str(appid) or str(appid) in game.get('title', '') or (is_shortcut and (name.lower() in game.get('name', '').lower() or name.lower() in game.get('title', '').lower())):
+            g_aid = str(game.get('appid', ''))
+            is_match = (
+                g_aid == str(appid)
+                or (det_aid and g_aid == str(det_aid))
+                or str(appid) in game.get('title', '')
+                or (is_shortcut and (name.lower() in game.get('name', '').lower() or name.lower() in game.get('title', '').lower()))
+            )
+            if is_match:
                 break
 
         # Check if steam launch helper or wine is still running
         reaper = subprocess.run(["pgrep", "-f", f"AppId={appid}"], stdout=subprocess.DEVNULL)
+        if is_shortcut and det_aid and reaper.returncode != 0:
+            reaper = subprocess.run(["pgrep", "-f", f"AppId={det_aid}"], stdout=subprocess.DEVNULL)
         wine_init = subprocess.run(["pgrep", "-f", "wineserver"], stdout=subprocess.DEVNULL)
         if reaper.returncode != 0 and wine_init.returncode != 0 and (time.time() - start_wait > 25):
             if game:
@@ -3238,6 +3671,11 @@ Options:
   --open-dir <id|name> [mgr]        Directly open game directory in file manager (yazi, dolphin, xdg)
   --open-saves <id|name> [mgr]      Directly open game save directory in file manager
   --sync-saves [id]                 Synchronize & share save data & cloud storage (all or per-app)
+  --toggle-offline                  Toggle Steam client between Online and Offline Mode
+  --is-offline                      Check if offline mode is enabled (exit code 0/1)
+  --check-controllers               Diagnose connected controllers, SDL2, and /dev/uinput health
+  --detect-appid <path|id>          Scan folder/shortcut for existing Steam AppID (e.g. Goldberg) & sync gamepad
+  --sync-shortcut-appids            Auto-scan all non-Steam shortcuts, detect AppIDs, & mirror controller configs
   --open-gui                        Open Steam GUI and reclaim RAM on window close
   --help                            Show this help message
 """)
@@ -3333,6 +3771,11 @@ def main():
     elif arg == "--status":
         game = get_running_steam_game()
         print(json.dumps(game, indent=2) if game else "null")
+    elif arg == "--toggle-offline":
+        toggle_offline_mode()
+        sys.exit(0)
+    elif arg == "--is-offline":
+        sys.exit(0 if is_offline_mode() else 1)
     elif arg == "--launch-and-monitor":
         if len(sys.argv) < 3:
             sys.stderr.write("Error: --launch-and-monitor requires <appid>\n")
@@ -3340,14 +3783,17 @@ def main():
         shortcut_id = None
         force_shim = False
         force_official = False
+        force_offline = False
         for a in sys.argv[3:]:
             if a == "--shim":
                 force_shim = True
             elif a == "--official":
                 force_official = True
+            elif a == "--offline":
+                force_offline = True
             elif not shortcut_id:
                 shortcut_id = a
-        launch_and_monitor(sys.argv[2], shortcut_id, force_shim=force_shim, force_official=force_official)
+        launch_and_monitor(sys.argv[2], shortcut_id, force_shim=force_shim, force_official=force_official, force_offline=force_offline)
     elif arg == "--edit-launch-options":
         if len(sys.argv) < 3:
             sys.stderr.write("Error: --edit-launch-options requires <appid>\n")
@@ -3390,6 +3836,55 @@ def main():
             print(f"\033[1;32m✔ Synchronized save data & cloud storage for {aname} ({aid}).\033[0m")
     elif arg == "--open-gui":
         open_steam_gui()
+    elif arg in ("--check-controllers", "--controllers", "--doctor-controller"):
+        check_controller_diagnostics()
+        sys.exit(0)
+    elif arg == "--detect-appid":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Error: --detect-appid requires <path_or_shortcut_id>\n")
+            sys.exit(1)
+        target = sys.argv[2]
+        shortcuts = get_non_steam_shortcuts()
+        sc = shortcuts.get(str(target))
+        if not sc:
+            for s in shortcuts.values():
+                if target.lower() in s["name"].lower():
+                    sc = s
+                    break
+        exe_path = sc.get("exe") if sc else target
+        start_dir = sc.get("startdir") if sc else (target if os.path.isdir(target) else None)
+        aid, origin = detect_game_appid(exe_path, start_dir)
+        if aid:
+            print(f"\033[1;32m✔ Detected Steam AppID:\033[0m \033[1;33m{aid}\033[0m")
+            print(f"  \033[1mOrigin:\033[0m       {origin}")
+            sc_aid = sc.get("appid") if sc else None
+            count = sync_shortcut_controller_configs(sc_aid, aid, start_dir)
+            print(f"  \033[1mGamepad Sync:\033[0m Synchronized {count} controller configsets (DualSense, Xbox, Generic)")
+            sys.exit(0)
+        else:
+            print(f"\033[1;33m✘ No existing Steam AppID found for:\033[0m {target}")
+            sys.exit(1)
+    elif arg in ("--sync-shortcut-appids", "--sync-shortcuts"):
+        shortcuts = get_non_steam_shortcuts()
+        print(f"\033[1;36mScanning {len(shortcuts)} non-Steam shortcuts for folder AppIDs & mirroring gamepad configs...\033[0m\n")
+        synced = 0
+        seen_shortcuts = set()
+        for sc in shortcuts.values():
+            s_id = sc.get("appid")
+            if s_id in seen_shortcuts:
+                continue
+            seen_shortcuts.add(s_id)
+            aid = sc.get("detected_appid")
+            name = sc.get("name", "Shortcut")
+            if aid:
+                c = sync_shortcut_controller_configs(s_id, aid, sc.get("startdir"))
+                print(f"  \033[1;32m✔\033[0m {name[:30]:<30} Shortcut: \033[1;33m{s_id}\033[0m ➔ Native: \033[1;32m{aid}\033[0m ({c} configsets)")
+                synced += 1
+            else:
+                c = sync_shortcut_controller_configs(s_id, None, sc.get("startdir"))
+                print(f"  \033[1;34m●\033[0m {name[:30]:<30} Shortcut: \033[1;33m{s_id}\033[0m (Standard gamepad fallback)")
+        print(f"\n\033[1;32mDone.\033[0m Controller configurations synchronized across non-Steam shortcuts.")
+        sys.exit(0)
     elif arg == "--ensure-daemon":
         start_headless_daemon()
     else:

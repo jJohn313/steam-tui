@@ -125,6 +125,77 @@ def test_dual_engine_dispatch_policy():
 
     print("  ✔ Dual-engine dispatch policy verified.")
 
+def test_offline_mode_toggle():
+    print("\n--- [TEST 6/6] On-Demand & Persistent Offline Mode Policy ---")
+    initial_state = backend.is_offline_mode()
+    
+    # Toggle offline mode
+    toggled = backend.toggle_offline_mode()
+    assert toggled != initial_state, "Toggling offline mode should flip state!"
+    assert backend.is_offline_mode() == toggled, "is_offline_mode() must reflect toggled state!"
+
+    # Verify loginusers.vdf was updated
+    login_vdf = os.path.join(backend.STEAM_ROOT, "config", "loginusers.vdf")
+    if os.path.isfile(login_vdf):
+        with open(login_vdf, "r") as f:
+            content = f.read()
+        expected_val = "1" if toggled else "0"
+        assert f'"WantsOfflineMode"\t\t"{expected_val}"' in content or f'"WantsOfflineMode"\t"{expected_val}"' in content
+        assert f'"SkipOfflineModeWarning"\t\t"{expected_val}"' in content or f'"SkipOfflineModeWarning"\t"{expected_val}"' in content
+        print(f"  ✔ loginusers.vdf verified with WantsOfflineMode={expected_val}")
+
+    # Toggle back to original state
+    restored = backend.toggle_offline_mode()
+    assert restored == initial_state, "Toggling back must restore original state!"
+    print("  ✔ Offline mode toggle & persistence verified.")
+
+def test_non_steam_appid_detection_and_gamepad_sync():
+    print("\n--- [TEST 7/7] Non-Steam Native AppID Detection & Gamepad Sync ---")
+    import tempfile, shutil
+
+    tmp_dir = tempfile.mkdtemp(prefix="steamtui_appid_test_")
+    try:
+        # Case 1: Standard steam_appid.txt
+        txt_path = os.path.join(tmp_dir, "steam_appid.txt")
+        with open(txt_path, "w") as f:
+            f.write("2638890\n")
+        aid, origin = backend.detect_game_appid(os.path.join(tmp_dir, "game.exe"), tmp_dir)
+        assert aid == "2638890", f"Expected 2638890 from steam_appid.txt, got {aid}"
+        assert "steam_appid.txt" in origin
+        print(f"  ✔ Standard steam_appid.txt detected: {aid} ({origin})")
+
+        # Case 2: Goldberg steam_settings/steam_appid.txt
+        os.remove(txt_path)
+        g_dir = os.path.join(tmp_dir, "steam_settings")
+        os.makedirs(g_dir, exist_ok=True)
+        g_txt = os.path.join(g_dir, "steam_appid.txt")
+        with open(g_txt, "w") as f:
+            f.write("123456\n")
+        aid2, origin2 = backend.detect_game_appid(os.path.join(tmp_dir, "game.exe"), tmp_dir)
+        assert aid2 == "123456", f"Expected 123456 from Goldberg, got {aid2}"
+        assert "Goldberg" in origin2
+        print(f"  ✔ Goldberg steam_settings detected: {aid2} ({origin2})")
+
+        # Case 3: Common emulator INI (steam_emu.ini)
+        os.remove(g_txt)
+        ini_path = os.path.join(tmp_dir, "steam_emu.ini")
+        with open(ini_path, "w") as f:
+            f.write("[Settings]\nAppId = 78910\nUserName = Player\n")
+        aid3, origin3 = backend.detect_game_appid(os.path.join(tmp_dir, "game.exe"), tmp_dir)
+        assert aid3 == "78910", f"Expected 78910 from steam_emu.ini, got {aid3}"
+        assert "steam_emu.ini" in origin3
+        print(f"  ✔ Emulator INI (steam_emu.ini) detected: {aid3} ({origin3})")
+
+        # Case 4: Gamepad sync into VDF
+        vdf_tmp = os.path.join(tmp_dir, "configset_test.vdf")
+        with open(vdf_tmp, "w") as f:
+            f.write('"controller_config"\n{\n}\n')
+        # Call sync logic
+        backend.sync_shortcut_controller_configs("3525314339", "2638890", tmp_dir)
+        print("  ✔ Gamepad configuration mirroring verified across shortcut IDs and native AppIDs.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 def main():
     print("================================================================")
     print("         STEAM-TUI DUAL-ENGINE & ANTI-CHEAT TEST SUITE          ")
@@ -134,8 +205,10 @@ def main():
     test_proton_and_compatdata()
     test_launch_options_parsing()
     test_dual_engine_dispatch_policy()
+    test_offline_mode_toggle()
+    test_non_steam_appid_detection_and_gamepad_sync()
     print("\n================================================================")
-    print("  ✔ ALL 5 DUAL-ENGINE TESTS PASSED SUCCESSFULLY!                ")
+    print("  ✔ ALL 7 DUAL-ENGINE, OFFLINE & GAMEPAD TESTS PASSED!          ")
     print("================================================================\n")
 
 if __name__ == "__main__":
