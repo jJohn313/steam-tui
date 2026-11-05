@@ -1290,6 +1290,7 @@ def get_non_steam_shortcuts():
                     "appid_origin": origin,
                 }
                 shortcuts[str(aid)] = sc_data
+                shortcuts[str(sc_id_64)] = sc_data
                 if det_aid and str(det_aid) != str(aid):
                     shortcuts[str(det_aid)] = sc_data
         except Exception:
@@ -3522,11 +3523,10 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
         except Exception:
             pass
 
-    is_shortcut = bool(shortcut_id)
-    if not is_shortcut:
-        shortcuts = get_non_steam_shortcuts()
+    shortcuts = get_non_steam_shortcuts()
+    is_shortcut = bool(shortcut_id) or (str(appid) in shortcuts)
+    if is_shortcut and not shortcut_id:
         if str(appid) in shortcuts:
-            is_shortcut = True
             shortcut_id = shortcuts[str(appid)]["shortcut_id"]
 
     name = get_game_name(appid)
@@ -3560,7 +3560,7 @@ def launch_and_monitor(appid, shortcut_id=None, force_shim=False, force_official
     det_aid = None
     det_origin = None
     if is_shortcut:
-        sc = shortcuts.get(str(appid)) or {}
+        sc = shortcuts.get(str(appid)) or (shortcuts.get(str(shortcut_id)) if shortcut_id else {}) or {}
         det_aid = sc.get("detected_appid")
         if not det_aid:
             det_aid, det_origin = detect_game_appid(sc.get("exe"), sc.get("startdir"))
