@@ -64,12 +64,12 @@ def get_steam_pss_mb():
     return max(0, total_pss_kb // 1024)
 
 def cdp_send(ws_url, msg_dict):
-    """Send a one-shot JSON RPC message to a Chromium DevTools WebSocket endpoint."""
+    """Send a one-shot JSON RPC message to a Chromium DevTools WebSocket endpoint with RFC 6455 masking."""
     try:
         p = urllib.parse.urlparse(ws_url)
         host, port = p.hostname or "127.0.0.1", p.port or 8080
         path = p.path
-        s = socket.create_connection((host, port), timeout=0.8)
+        s = socket.create_connection((host, port), timeout=1.0)
         req = (
             f"GET {path} HTTP/1.1\r\n"
             f"Host: {host}:{port}\r\n"
@@ -84,15 +84,16 @@ def cdp_send(ws_url, msg_dict):
             s.close()
             return False
         payload = json.dumps(msg_dict).encode("utf-8")
+        mask = b"\x12\x34\x56\x78"
+        masked = bytes([b ^ mask[i % 4] for i, b in enumerate(payload)])
         length = len(payload)
         if length <= 125:
-            header = bytes([0x81, 0x80 | length, 0, 0, 0, 0])
+            header = bytes([0x81, 0x80 | length]) + mask
         elif length <= 65535:
-            header = bytes([0x81, 0x80 | 126, (length >> 8) & 0xff, length & 0xff, 0, 0, 0, 0])
+            header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", length) + mask
         else:
-            s.close()
-            return False
-        s.sendall(header + payload)
+            header = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", length) + mask
+        s.sendall(header + masked)
         try:
             s.settimeout(0.5)
             s.recv(1024)
@@ -102,6 +103,89 @@ def cdp_send(ws_url, msg_dict):
         return True
     except Exception:
         return False
+
+def get_shared_js_ws_url():
+    """Retrieve the WebSocket URL for SharedJSContext via Steam DevTools."""
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8080/json", headers={"User-Agent": "steam-tui"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            targets = json.loads(resp.read().decode("utf-8"))
+            for t in targets:
+                if "SharedJSContext" in t.get("title", "") or "SharedJSContext" in t.get("url", ""):
+                    return t.get("webSocketDebuggerUrl")
+            if targets:
+                return targets[0].get("webSocketDebuggerUrl")
+    except Exception:
+        pass
+    return None
+
+def cdp_eval_shared(expr, timeout=6.0):
+    """Evaluate an expression in SharedJSContext with full frame decoding & response extraction."""
+    ws_url = get_shared_js_ws_url()
+    if not ws_url:
+        return None
+    try:
+        p = urllib.parse.urlparse(ws_url)
+        s = socket.create_connection((p.hostname, p.port), timeout=timeout)
+        s.sendall(
+            f"GET {p.path} HTTP/1.1\r\n"
+            f"Host: {p.hostname}:{p.port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n".encode()
+        )
+        resp = s.recv(4096)
+        if b"101" not in resp:
+            s.close()
+            return None
+        payload = json.dumps({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {"expression": expr, "returnByValue": True, "awaitPromise": True}
+        }).encode()
+        mask = b"\x12\x34\x56\x78"
+        masked = bytes([b ^ mask[i % 4] for i, b in enumerate(payload)])
+        length = len(payload)
+        if length <= 125:
+            header = bytes([0x81, 0x80 | length]) + mask
+        elif length <= 65535:
+            header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", length) + mask
+        else:
+            header = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", length) + mask
+        s.sendall(header + masked)
+
+        def read_exact(n):
+            res = b""
+            while len(res) < n:
+                chunk = s.recv(n - len(res))
+                if not chunk: raise EOFError
+                res += chunk
+            return res
+
+        s.settimeout(timeout)
+        while True:
+            hdr = read_exact(2)
+            opcode = hdr[0] & 0x0f
+            is_masked = bool(hdr[1] & 0x80)
+            pay_len = hdr[1] & 0x7f
+            if pay_len == 126:
+                pay_len = struct.unpack("!H", read_exact(2))[0]
+            elif pay_len == 127:
+                pay_len = struct.unpack("!Q", read_exact(8))[0]
+            mask_key = read_exact(4) if is_masked else None
+            body = read_exact(pay_len)
+            if mask_key:
+                body = bytes([b ^ mask_key[i % 4] for i, b in enumerate(body)])
+            if opcode == 1:
+                data = json.loads(body.decode("utf-8"))
+                if data.get("id") == 1:
+                    s.close()
+                    res = data.get("result", {}).get("result", {})
+                    return res.get("value")
+    except Exception:
+        pass
+    return None
 
 FILTER_KEYWORDS = [
     "proton",
@@ -2366,24 +2450,108 @@ def start_headless_daemon(force_offline=False):
             print(" \033[1;33m[Timeout waiting for ready, proceeding]\033[0m")
         constrain_headless_cef(in_game=False)
 
+def get_primary_net_rx():
+    """Retrieve total received bytes across active non-loopback network interfaces."""
+    try:
+        with open("/proc/net/dev", "r") as f:
+            lines = f.readlines()[2:]
+        best_rx = 0
+        for line in lines:
+            if ":" not in line:
+                continue
+            iface, data = line.split(":", 1)
+            iface = iface.strip()
+            if iface in ("lo", "docker0") or iface.startswith("br-"):
+                continue
+            parts = data.split()
+            if parts:
+                rx = int(parts[0])
+                if rx > best_rx:
+                    best_rx = rx
+        return best_rx
+    except Exception:
+        return 0
+
+def get_steam_libraries():
+    """Returns list of library dicts: [{'index': int, 'path': str, 'free': int, 'is_default': bool}]."""
+    # 1. Try querying via Steam's CDP installFolderStore first
+    try:
+        res = cdp_eval_shared("""
+        (() => {
+            if (typeof installFolderStore !== 'undefined' && installFolderStore.MountedInstallFolders) {
+                return installFolderStore.MountedInstallFolders.map(f => ({
+                    index: f.nFolderIndex,
+                    path: f.strFolderPath,
+                    free: f.nFreeSpace,
+                    is_default: f.bIsDefaultFolder
+                }));
+            }
+            return null;
+        })()
+        """)
+        if res and isinstance(res, list) and len(res) > 0:
+            return sorted(res, key=lambda x: x["index"])
+    except Exception:
+        pass
+
+    # 2. Fallback: Parse libraryfolders.vdf
+    vdf = os.path.join(STEAM_ROOT, "steamapps", "libraryfolders.vdf")
+    libs = []
+    if os.path.isfile(vdf):
+        try:
+            with open(vdf, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            blocks = re.findall(r"\"(\d+)\"\s*\{([^}]+)\}", content, re.DOTALL)
+            for idx_str, body in blocks:
+                idx = int(idx_str)
+                m_path = re.search(r"\"path\"\s+\"([^\"]+)\"", body)
+                if m_path:
+                    p = m_path.group(1).replace("\\\\", "/")
+                    if os.path.isdir(p):
+                        try:
+                            _, _, free = shutil.disk_usage(p)
+                        except Exception:
+                            free = 0
+                        libs.append({"index": idx, "path": p, "free": free, "is_default": (idx == 0)})
+        except Exception:
+            pass
+    if not libs:
+        libs = [{"index": 0, "path": STEAM_ROOT, "free": 0, "is_default": True}]
+    return sorted(libs, key=lambda x: x["index"])
+
 def select_library_folder():
-    """Let user pick target drive if multiple Steam libraries exist."""
-    libs = get_library_folders()
+    """Let user pick target drive if multiple Steam libraries exist, defaulting to drive with most space."""
+    libs = get_steam_libraries()
     if len(libs) <= 1:
-        return 0, libs[0]
+        return libs[0]["index"], libs[0]["path"]
+
+    default_choice = 0
+    max_free = -1
+    for i, lib in enumerate(libs):
+        if lib.get("is_default"):
+            default_choice = i
+        if lib.get("free", 0) > max_free:
+            max_free = lib.get("free", 0)
+
+    # If default drive has low space (< 60 GB) and another drive has more, recommend the larger drive
+    if libs[default_choice].get("free", 0) < 60 * 1024 * 1024 * 1024 and max_free > libs[default_choice].get("free", 0):
+        for i, lib in enumerate(libs):
+            if lib.get("free", 0) == max_free:
+                default_choice = i
+                break
 
     print("\n\033[1;36mSelect target Steam Library drive:\033[0m")
-    for idx, path in enumerate(libs):
-        try:
-            total, used, free = shutil.disk_usage(path)
-            free_str = f"(\033[1;32m{format_size(free)} free\033[0m)"
-        except Exception:
-            free_str = ""
-        print(f"  \033[1;33m[{idx}]\033[0m {path} {free_str}")
+    for idx, lib in enumerate(libs):
+        path = lib["path"]
+        free = lib.get("free", 0)
+        free_str = f"(\033[1;32m{format_size(free)} free\033[0m)" if free else ""
+        def_tag = " \033[1;35m(Default)\033[0m" if idx == default_choice else ""
+        print(f"  \033[1;33m[{idx}]\033[0m {path} {free_str}{def_tag}")
 
-    choice = input(f"\nSelect library [0-{len(libs)-1}] (default 0): ").strip()
-    idx = int(choice) if choice.isdigit() and 0 <= int(choice) < len(libs) else 0
-    return idx, libs[idx]
+    choice = input(f"\nSelect library [0-{len(libs)-1}] (default {default_choice}): ").strip()
+    sel_idx = int(choice) if choice.isdigit() and 0 <= int(choice) < len(libs) else default_choice
+    selected_lib = libs[sel_idx]
+    return selected_lib["index"], selected_lib["path"]
 
 def find_manifest_across_libraries(appid):
     """Find appmanifest_<appid>.acf across all drives (even if newly created)."""
@@ -2668,58 +2836,92 @@ def track_update(appid, is_new_install=False):
     # 1. Ensure minimal Steam daemon is running in background and ready
     start_headless_daemon()
 
-    # 2. Trigger headless install/update via bootstrap ACF or steam://install
+    # 2. Trigger headless install/update via Steam WebUI CDP or steam://install
     if is_new_install:
-        lib_idx, lib_path = select_library_folder()
+        lib_folder_idx, lib_path = select_library_folder()
         print(f"\n\033[1;36mDispatching headless install for {name} to {lib_path}...\033[0m")
-        
-        # Write bootstrap appmanifest_<appid>.acf with StateFlags "2" (Update Required)
-        # This tells Steam the target library and bypasses drive selection/EULA modals
-        target_steamapps = os.path.join(lib_path, "steamapps")
-        os.makedirs(target_steamapps, exist_ok=True)
-        manifest_file = os.path.join(target_steamapps, f"appmanifest_{appid}.acf")
-        if not os.path.exists(manifest_file):
-            try:
-                bootstrap_content = (
-                    '"AppState"\n'
-                    '{\n'
-                    f'\t"appid"\t\t"{appid}"\n'
-                    '\t"Universe"\t\t"1"\n'
-                    f'\t"name"\t\t"{name}"\n'
-                    '\t"StateFlags"\t\t"2"\n'
-                    '\t"installdir"\t\t""\n'
-                    '\t"LastUpdated"\t\t"0"\n'
-                    '\t"SizeOnDisk"\t\t"0"\n'
-                    '}\n'
-                )
-                with open(manifest_file, "w", encoding="utf-8") as f:
-                    f.write(bootstrap_content)
-            except Exception:
-                pass
 
-        # Trigger download in Steam via steam://install/<appid> and -applaunch
-        subprocess.Popen([REAL_STEAM, "-silent", f"steam://install/{appid}"], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        time.sleep(1)
-        subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        # 1. Ensure target drive is set as default install folder in Steam
+        cdp_eval_shared(f"SteamClient.InstallFolder.SetDefaultInstallFolder({lib_folder_idx})")
+
+        # 2. Trigger programmatic install via Steam's WebUI manager with automated EULA approval
+        cdp_script = f"""
+        (async () => {{
+            let req;
+            try {{
+                window.webpackChunksteamui.push([[Symbol()], {{}}, (r) => {{ req = r; }}]);
+                let mod = req(65691);
+                let manager = mod.I;
+
+                // Clean up any stale/broken uninstalled manifest state
+                let ov = appStore.GetAppOverviewByAppID({appid});
+                if (ov && ov.installed) {{
+                    try {{
+                        await SteamClient.Installs.OpenUninstallWizard([{appid}], "0", true);
+                        await new Promise(r => setTimeout(r, 500));
+                    }} catch(e) {{}}
+                }}
+
+                // Dispatch install wizard
+                manager.InstallApp({appid}, "0");
+
+                // Wait for install manager to acquire state
+                for (let i = 0; i < 30; i++) {{
+                    await new Promise(r => setTimeout(r, 100));
+                    let im = manager.GetInstallManager();
+                    if (im && im.rgApps && im.rgApps.length > 0) {{
+                        if (im.iInstallFolder !== {lib_folder_idx}) {{
+                            try {{ await SteamClient.Installs.SetInstallFolder({lib_folder_idx}); }} catch(e) {{}}
+                        }}
+                        break;
+                    }}
+                }}
+
+                // Automatically accept any EULAs attached to this app
+                try {{
+                    let eula = await SteamClient.Apps.LoadEula({appid});
+                    if (eula && Array.isArray(eula)) {{
+                        for (const item of eula) {{
+                            if (item && item.id) {{
+                                SteamClient.Apps.MarkEulaAccepted({appid}, item.id, item.version || 1);
+                            }}
+                        }}
+                    }}
+                }} catch(e) {{}}
+
+                // Finalize requested install
+                await manager.StartRequestedInstall();
+
+                // Unpause and resume in downloads queue
+                try {{ SteamClient.Downloads.ResumeAppUpdate({appid}, "0"); }} catch(e) {{}}
+                return "ok";
+            }} catch(e) {{
+                return "err: " + (e.stack || e.toString());
+            }}
+        }})()
+        """
+        res = cdp_eval_shared(cdp_script, timeout=8.0)
+        if not res or (isinstance(res, str) and res.startswith("err:")):
+            # Fallback to standard URL invocation
+            subprocess.Popen([REAL_STEAM, "-silent", f"steam://install/{appid}"], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     else:
         print(f"\n\033[1;36mDispatching headless update for {name}...\033[0m")
+        cdp_eval_shared(f"SteamClient.Downloads.ResumeAppUpdate({appid}, '0')")
         subprocess.Popen([REAL_STEAM, "-silent", f"steam://install/{appid}"], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-        time.sleep(1)
-        subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
-    # 3. Wait up to 15 seconds for Steam to allocate/recognize appmanifest_<appid>.acf
+    # 3. Wait up to 25 seconds for Steam to allocate disk space & generate appmanifest_<appid>.acf
     manifest_path = find_manifest_across_libraries(appid)
     if not manifest_path:
         sys.stdout.write("\033[1;33mAllocating disk space & generating manifest...\033[0m")
         sys.stdout.flush()
-        for _ in range(30):
+        for _ in range(50):
             time.sleep(0.5)
             manifest_path = find_manifest_across_libraries(appid)
             if manifest_path:
                 break
         if not manifest_path:
-            # Fallback trigger
-            subprocess.Popen([REAL_STEAM, "-silent", "-applaunch", str(appid)], env=get_steam_env(headless=True), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Fallback: re-trigger resume / queue
+            cdp_eval_shared(f"SteamClient.Downloads.ResumeAppUpdate({appid}, '0')")
             for _ in range(20):
                 time.sleep(0.5)
                 manifest_path = find_manifest_across_libraries(appid)
@@ -2733,8 +2935,10 @@ def track_update(appid, is_new_install=False):
     print(f"\r\033[K\033[2m[Ctrl+C] to detach (download continues in background)\033[0m\n")
 
     content_log = os.path.join(STEAM_ROOT, "logs", "content_log.txt")
+    down_dir = os.path.join(os.path.dirname(manifest_path), "downloading", str(appid))
     last_bytes = 0
     last_time = time.time()
+    last_net_rx = get_primary_net_rx()
     speed_mb_s = 0.0
     has_started = False
     init_check_time = time.time()
@@ -2752,12 +2956,25 @@ def track_update(appid, is_new_install=False):
             st = acf["bytes_staged"]
             to_st = acf["bytes_to_stage"]
 
+            # Scan actual live staged blocks on disk in downloading/<appid> (<1ms)
+            staged_live = 0
+            if os.path.isdir(down_dir):
+                for root, _, files in os.walk(down_dir):
+                    for file in files:
+                        try:
+                            staged_live += os.stat(os.path.join(root, file)).st_blocks * 512
+                        except Exception:
+                            pass
+
+            target_bytes = to_st if to_st > 0 else to_dl
+            curr_bytes = max(dl, st, staged_live)
+
             # Mark if download or update activity is detected
-            if (sf & 1024) or (to_dl > 0 and dl > 0) or (to_st > 0):
+            if (sf & 1024) or (to_dl > 0 and dl > 0) or (to_st > 0) or (staged_live > 0):
                 has_started = True
 
             # StateFlags == 4 means Fully Installed and Ready
-            if sf == 4 and (to_dl == 0 or dl >= to_dl):
+            if sf == 4 and (not os.path.isdir(down_dir) or (target_bytes > 0 and curr_bytes >= target_bytes)):
                 if has_started:
                     print(f"\r\033[K\033[1;32m✔ Installation/Update complete for {name}!\033[0m\n")
                     subprocess.run(["notify-send", "Steam (Headless)", f"{name} is ready!", "-i", "steam"], check=False)
@@ -2766,58 +2983,52 @@ def track_update(appid, is_new_install=False):
                     print(f"\r\033[K\033[1;32m✔ {name} is already up to date and ready to play!\033[0m\n")
                     return
 
-            # Parse real-time download rate from content_log.txt if available
-            if os.path.isfile(content_log):
-                try:
-                    with open(content_log, "rb") as f:
-                        f.seek(0, os.SEEK_END)
-                        f.seek(max(0, f.tell() - 4096), os.SEEK_SET)
-                        tail = f.read().decode("utf-8", errors="ignore")
-                    rate_matches = re.findall(r"Current download rate:\s+([\d\.]+)\s+Mbps", tail)
-                    if rate_matches:
-                        # Convert Mbps to MB/s
-                        speed_mb_s = float(rate_matches[-1]) / 8.0
-                except Exception:
-                    pass
-
-            # Fallback rate calculation from manifest delta
+            # Live network speed calculation from interface RX bytes
             now = time.time()
-            dt = now - last_time
-            if dt >= 1.5 and speed_mb_s == 0.0:
-                delta_bytes = max(0, dl - last_bytes)
-                speed_mb_s = (delta_bytes / (1024 * 1024)) / dt
-                last_bytes = dl
-                last_time = now
+            dt = max(0.1, now - last_time)
+            net_rx = get_primary_net_rx()
+            if last_net_rx > 0 and net_rx >= last_net_rx:
+                instant_speed = ((net_rx - last_net_rx) / (1024 * 1024)) / dt
+                speed_mb_s = instant_speed if speed_mb_s == 0.0 else (0.6 * speed_mb_s + 0.4 * instant_speed)
+            last_net_rx = net_rx
+            last_time = now
 
-            if to_dl > 0:
-                pct = min(100.0, (dl / to_dl) * 100.0)
-            elif to_st > 0:
-                pct = min(100.0, (st / to_st) * 100.0)
+            if target_bytes > 0:
+                pct = min(99.9, (curr_bytes / target_bytes) * 100.0)
             else:
                 pct = 0.0
 
-            bar_len = 28
+            bar_len = 24
             filled = int(bar_len * pct / 100.0)
             bar = "█" * filled + "░" * (bar_len - filled)
 
+            rem_bytes = max(0, target_bytes - curr_bytes)
             eta_str = ""
-            if speed_mb_s > 0.05 and to_dl > dl:
-                rem_sec = int((to_dl - dl) / (speed_mb_s * 1024 * 1024))
+            if speed_mb_s > 0.2 and rem_bytes > 0:
+                rem_sec = int(rem_bytes / (speed_mb_s * 1024 * 1024))
                 mins, secs = divmod(rem_sec, 60)
-                eta_str = f"| ETA: {mins}m {secs:02d}s"
+                if mins >= 60:
+                    hrs, mins = divmod(mins, 60)
+                    eta_str = f"│ ETA: {hrs}h {mins:02d}m"
+                else:
+                    eta_str = f"│ ETA: {mins}m {secs:02d}s"
 
-            if sf & 1024:
-                status_txt = "\033[1;36mDownloading\033[0m"
-            elif st > 0 and st < to_st:
-                status_txt = "\033[1;35mUnpacking/Staging\033[0m"
+            if sf == 4:
+                status_txt = "\033[1;32mComplete\033[0m"
+            elif speed_mb_s > 0.5:
+                status_txt = "\033[1;36mDownloading & Staging\033[0m"
+            elif curr_bytes > last_bytes:
+                status_txt = "\033[1;35mDecompressing / Staging\033[0m"
             elif sf & 512:
                 status_txt = "\033[1;33mPaused\033[0m"
             else:
                 status_txt = "\033[1;34mPre-allocating\033[0m"
 
+            last_bytes = curr_bytes
+
             progress_line = (
                 f"\r\033[K\033[1;36m[{bar}]\033[0m {pct:5.1f}% │ "
-                f"{format_size(dl)} / {format_size(to_dl)} │ "
+                f"{format_size(curr_bytes)} / {format_size(target_bytes)} │ "
                 f"{speed_mb_s:5.1f} MB/s {eta_str} │ {status_txt}"
             )
             sys.stdout.write(progress_line)
@@ -2826,6 +3037,7 @@ def track_update(appid, is_new_install=False):
 
     except KeyboardInterrupt:
         print("\n\n\033[1;33mDetached from progress view. Download continues in background.\033[0m")
+        spawn_download_watcher()
 
 def uninstall_app(appid):
     """Trigger uninstallation for an installed Steam app."""
@@ -2846,6 +3058,91 @@ def uninstall_app(appid):
         time.sleep(1.5)
     else:
         print("Uninstallation cancelled.")
+
+def get_active_downloads():
+    """Detect any active downloads/updates across all Steam libraries.
+    Returns list of dicts: [{'appid': appid, 'name': name, 'bytes_dl': bytes_dl, 'bytes_tot': bytes_tot, 'library': lib}]
+    """
+    active = []
+    # 1. First check CDP if available
+    try:
+        res = cdp_eval_shared("""
+        (() => {
+            if (typeof downloadOverviewStore !== 'undefined' && downloadOverviewStore.GetActiveAppDownloadOverview) {
+                const ov = downloadOverviewStore.GetActiveAppDownloadOverview();
+                if (ov && ov.appid) {
+                    return [{
+                        appid: String(ov.appid),
+                        name: ov.strTitle || ov.name || '',
+                        bytes_dl: ov.nBytesDownloaded || 0,
+                        bytes_tot: ov.nTotalBytes || 0
+                    }];
+                }
+            }
+            return null;
+        })()
+        """)
+        if res and isinstance(res, list) and len(res) > 0:
+            return res
+    except Exception:
+        pass
+
+    # 2. Filesystem check across all libraries
+    libs = [STEAM_ROOT]
+    vdf = os.path.join(STEAM_ROOT, "steamapps", "libraryfolders.vdf")
+    if os.path.isfile(vdf):
+        try:
+            with open(vdf, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            paths = re.findall(r"\"path\"\s+\"([^\"]+)\"", content)
+            for p in paths:
+                p_clean = p.replace("\\\\", "/")
+                if os.path.isdir(p_clean) and p_clean not in libs:
+                    libs.append(p_clean)
+        except Exception:
+            pass
+
+    for lib in libs:
+        m_dir = os.path.join(lib, "steamapps")
+        d_dir = os.path.join(m_dir, "downloading")
+        if not os.path.isdir(m_dir):
+            continue
+
+        down_ids = set()
+        if os.path.isdir(d_dir):
+            for item in os.listdir(d_dir):
+                if item.isdigit():
+                    down_ids.add(item)
+
+        for mf in glob.glob(os.path.join(m_dir, "appmanifest_*.acf")):
+            try:
+                with open(mf, "r", encoding="utf-8", errors="ignore") as f:
+                    cnt = f.read()
+                m_aid = re.search(r"\"appid\"\s+\"(\d+)\"", cnt)
+                if not m_aid:
+                    continue
+                aid = m_aid.group(1)
+                m_state = re.search(r"\"StateFlags\"\s+\"(\d+)\"", cnt)
+                state = int(m_state.group(1)) if m_state else 0
+
+                # 1024 = k_EAppStateUpdateRunning, 512 = k_EAppStateUpdateQueued, 8192 = k_EAppStateUpdateStarted
+                if aid in down_ids or (state & (1024 | 512 | 8192) != 0):
+                    m_name = re.search(r"\"name\"\s+\"([^\"]+)\"", cnt)
+                    name = m_name.group(1) if m_name else f"AppID {aid}"
+                    m_dl = re.search(r"\"BytesDownloaded\"\s+\"(\d+)\"", cnt)
+                    m_tot = re.search(r"\"BytesToDownload\"\s+\"(\d+)\"", cnt)
+                    b_dl = int(m_dl.group(1)) if m_dl else 0
+                    b_tot = int(m_tot.group(1)) if m_tot else 0
+                    active.append({
+                        "appid": aid,
+                        "name": name,
+                        "bytes_dl": b_dl,
+                        "bytes_tot": b_tot,
+                        "library": lib
+                    })
+            except Exception:
+                pass
+    return active
 
 def get_running_steam_game():
     """Detect any actively running Steam game on Hyprland / system."""
@@ -3128,6 +3425,91 @@ def safe_post_game_shutdown(appid=None):
             subprocess.run(["pkill", "-9", "-x", "steamwebhelper"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["pkill", "-9", "-f", "srt-logger"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     cleanup_stale_steam_locks()
+
+def spawn_download_watcher():
+    """Spawn detached background download auto-shutdown watcher."""
+    backend_bin = os.path.realpath(__file__)
+    try:
+        subprocess.Popen(
+            [sys.executable, backend_bin, "--auto-shutdown-downloads"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+    except Exception:
+        pass
+
+def auto_shutdown_download_watcher():
+    """Detached background worker that monitors background downloads and shuts down Steam once complete (0 MB idle RAM)."""
+    import time
+    # Prevent duplicate watchers
+    try:
+        pids = subprocess.check_output(["pgrep", "-f", "--auto-shutdown-downloads"], stderr=subprocess.DEVNULL).decode("utf-8").strip().split()
+        my_pid = str(os.getpid())
+        other_pids = [p for p in pids if p != my_pid]
+        if other_pids:
+            return
+    except Exception:
+        pass
+
+    # Initial grace window for newly queued downloads to register
+    time.sleep(3.0)
+
+    while True:
+        time.sleep(4.0)
+
+        # 1. If Steam client itself is not running at all, exit watcher
+        if subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL).returncode != 0:
+            break
+
+        # 2. If a Steam GUI window is open in Hyprland, user is actively interacting; wait
+        has_gui_win = False
+        try:
+            out = subprocess.check_output(["hyprctl", "-j", "clients"], stderr=subprocess.DEVNULL).decode("utf-8")
+            for c in json.loads(out):
+                if c.get("class") == "steam" and c.get("title") == "Steam":
+                    has_gui_win = True
+                    break
+        except Exception:
+            pass
+        if has_gui_win:
+            continue
+
+        # 3. If a game is actively running, don't interfere; wait
+        if get_running_steam_game():
+            continue
+
+        # 4. Check active downloads
+        active_dls = get_active_downloads()
+        if active_dls:
+            continue
+
+        # 5. Check if another track_update process is actively running in a terminal
+        try:
+            tracker_pids = subprocess.check_output(["pgrep", "-f", "--track-update"], stderr=subprocess.DEVNULL).decode("utf-8").strip().split()
+            if tracker_pids:
+                continue
+        except Exception:
+            pass
+
+        # All downloads completed, no game running, no GUI window open -> Safe shutdown!
+        try:
+            subprocess.run(["notify-send", "Steam (Headless)", "All downloads complete. Reclaiming RAM (0 MB idle)...", "-i", "steam"], check=False)
+        except Exception:
+            pass
+
+        if subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL).returncode == 0:
+            subprocess.run([REAL_STEAM, "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(12):
+                time.sleep(0.5)
+                if subprocess.run(["pgrep", "-x", "steam"], stdout=subprocess.DEVNULL).returncode != 0:
+                    break
+            else:
+                subprocess.run(["pkill", "-9", "-x", "steam"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["pkill", "-9", "-x", "steamwebhelper"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["pkill", "-9", "-f", "srt-logger"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cleanup_stale_steam_locks()
+        break
 
 def auto_shutdown_watcher(appid=None):
     """Detached background worker that monitors a running game and invokes safe_post_game_shutdown when done."""
@@ -3707,7 +4089,7 @@ def open_steam_gui():
 
     print("Launching Steam GUI (Store/Community mode)...")
     cleanup_stale_steam_locks()
-    subprocess.Popen([REAL_STEAM], env=get_steam_env(headless=False), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    subprocess.Popen([REAL_STEAM, "-cef-enable-debugging"], env=get_steam_env(headless=False), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
     # Wait for window to appear
     steam_addr = None
@@ -3740,8 +4122,25 @@ def open_steam_gui():
             still_open = any(c.get('address') == steam_addr for c in json.loads(out))
             if not still_open:
                 if not get_running_steam_game():
-                    print("\033[1;33mSteam GUI closed. Shutting down Chromium/CEF processes to reclaim RAM...\033[0m")
-                    subprocess.run([REAL_STEAM, "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    active_dls = get_active_downloads()
+                    if active_dls:
+                        names = ", ".join([d["name"] for d in active_dls])
+                        print(f"\n\033[1;36m[Steam TUI]\033[0m Steam GUI closed, but background downloads are active: \033[1;33m{names}\033[0m")
+                        print("\033[1;32mLeaving Steam daemon active in background so downloads continue.\033[0m")
+                        if len(active_dls) == 1 and active_dls[0]["appid"] != "0":
+                            aid = active_dls[0]["appid"]
+                            print(f"\033[1;36mTransitioning to terminal download tracker for {active_dls[0]['name']}...\033[0m\n")
+                            track_update(aid, is_new_install=False)
+                            if not get_running_steam_game() and not get_active_downloads():
+                                print("\033[1;32m✔ Download complete. Shutting down Steam daemon to reclaim RAM...\033[0m")
+                                subprocess.run([REAL_STEAM, "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        else:
+                            print("\033[2mDownloads running in background. You can track progress anytime with 'steam-tui-backend --track-update <appid>'.\033[0m\n")
+                            spawn_download_watcher()
+                            return
+                    else:
+                        print("\033[1;33mSteam GUI closed. Shutting down Chromium/CEF processes to reclaim RAM...\033[0m")
+                        subprocess.run([REAL_STEAM, "-shutdown"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 break
         except Exception:
             break
@@ -3828,6 +4227,9 @@ def main():
     elif arg == "--auto-shutdown":
         appid = sys.argv[2] if len(sys.argv) > 2 else None
         auto_shutdown_watcher(appid)
+        sys.exit(0)
+    elif arg == "--auto-shutdown-downloads":
+        auto_shutdown_download_watcher()
         sys.exit(0)
     elif arg == "--check-ac":
         if len(sys.argv) < 3:
