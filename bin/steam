@@ -72,6 +72,26 @@ if "$BACKEND" --has-running; then
     fi
 fi
 
+# Load Matugen top-layer palette from ~/.cache/theme_tokens.json (with fallback)
+read -r T_PRI T_SEC T_TER T_BGHI T_ON T_VAR T_OUT T_ERR <<< "$(python3 -c '
+import json, os
+p = os.path.expanduser("~/.cache/theme_tokens.json")
+try:
+    c = json.load(open(p)).get("colors", {})
+except Exception:
+    c = {}
+print(
+    c.get("primary", "#b4befe"),
+    c.get("secondary", "#cba6f7"),
+    c.get("tertiary", "#fab387"),
+    c.get("surface_container_high", "#1e1e2e"),
+    c.get("on_surface", "#cdd6f4"),
+    c.get("on_surface_variant", "#6c7086"),
+    c.get("outline", "#a6adc8"),
+    c.get("error", "#f38ba8"),
+)
+')"
+
 # 4. Interactive Library & Persistent Session Loop
 while true; do
     GAME_LIST=$("$BACKEND" --list)
@@ -83,11 +103,11 @@ while true; do
 
     if "$BACKEND" --is-offline >/dev/null 2>&1; then
         BORDER_LABEL=" 🎮 STEAM LIBRARY [OFFLINE] "
-        BORDER_COLOR="border:#fab387,label:#fab387"
+        BORDER_COLOR="border:$T_TER,label:$T_TER"
         HEADER_TXT=" ↵ Launch  │  ^F Files & Saves  │  ^O Options  │  ^P Proton  │  ^T Mode (OFFLINE)  │  ^S Steam GUI  │  ^Z 0MB Shim "
     else
         BORDER_LABEL=" 🎮 STEAM LIBRARY [ONLINE] "
-        BORDER_COLOR="border:#b4befe,label:#cba6f7"
+        BORDER_COLOR="border:$T_PRI,label:$T_SEC"
         HEADER_TXT=" ↵ Launch  │  ^F Files & Saves  │  ^O Options  │  ^P Proton  │  ^T Mode (ONLINE)  │  ^S Steam GUI  │  ^Z 0MB Shim "
     fi
 
@@ -105,7 +125,7 @@ while true; do
         --prompt=" 🔍 " \
         --pointer="❯ " \
         --marker="✔ " \
-        --color="bg+:#1e1e2e,fg+:#cdd6f4,hl:#f38ba8,hl+:#f38ba8,$BORDER_COLOR,prompt:#cba6f7,pointer:#f5e0dc,header:#6c7086,info:#a6adc8" \
+        --color="bg+:$T_BGHI,fg+:$T_ON,hl:$T_ERR,hl+:$T_PRI,$BORDER_COLOR,prompt:$T_SEC,pointer:$T_TER,header:$T_VAR,info:$T_OUT" \
         --header="$HEADER_TXT" \
         --preview="$BACKEND --preview {2} {3}" \
         --preview-window="right:58%:border-left:nowrap" \
